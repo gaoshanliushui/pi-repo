@@ -1,0 +1,1557 @@
+{
+  "model": "deepseek/deepseek-v4-flash",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n- read: Read file contents\n- bash: Execute bash commands (ls, grep, find, etc.)\n- edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call\n- write: Create or overwrite files\n- web_search: Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles over a single query for broader coverage.\n- fetch_content: Use to extract readable content from URL(s), YouTube, GitHub repos, or local videos. For video questions, pass the user's exact question in prompt.\n- get_search_content: Use after web_search/fetch_content when full stored content is needed via responseId plus query/url selectors.\n- workflow: Run a deterministic JavaScript workflow. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }.\n- mcp: MCP gateway - connect to MCP servers and call their tools\n- ask_user_question: Ask the user up to 4 structured questions (2-4 options each) when requirements are ambiguous\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n- Use bash for file operations like ls, rg, find\n- Use read to examine files instead of cat or sed.\n- Use edit for precise changes (edits[].oldText must match exactly)\n- When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls\n- Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.\n- Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.\n- Use write only for new files or complete rewrites.\n- Use workflow only when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.\n- For workflow, always pass one raw JavaScript string in the required script parameter; do not include Markdown fences or prose around the script.\n- For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description', phases: [{ title: 'Phase name' }] }`; meta.name and meta.description are required non-empty strings.\n- For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, Date.now(), Math.random(), or new Date().\n- For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.\n- For workflow, prefer the built-in quality helpers when they fit (each is built on agent()/parallel() and returns plain data): verify(item, {reviewers, threshold, lens}) for adversarial fact-checking; judgePanel(attempts, {judges, rubric}) to score N candidates and return the best; loopUntilDry({round, key, consecutiveEmpty}) to keep finding until rounds stop yielding new items; completenessCheck(args, results) as a final 'what's missing' critic.\n- For workflow, when meta.phases declares more than one phase, call phase('Exact Title') at the start of each phase's work (or set opts.phase on each agent) so every agent groups under the correct phase; never declare a phase you don't switch into — a declared phase with no agents shows as 0/0 and any agent you forgot to move stays in the previous phase.\n- For workflow, do not set tokenBudget or agentTimeoutMs unless the user explicitly asks to cap spend or time; the defaults are unbounded.\n- For workflow, to bound spend: pass tokenBudget for a hard run-wide cap; carve a per-phase ceiling with phase('Name', {budget: N}) (that phase throws at its sub-budget without touching the run total — wrap its work in try/catch so later phases proceed); use retry(thunk, {attempts, until}) for bounded retry, and gate(thunk, validator, {attempts}) when a validator's feedback should steer the next attempt. To degrade gracefully, branch on budget.remaining() to skip optional rounds or choose a lighter tier.\n- For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.\n- For workflow, parallel() takes functions, not promises: use `await parallel(items.map(item => () => agent('...', { label: '...' })))`, never `await parallel(items.map(item => agent(...)))`. Results are returned in input order.\n- For workflow, pipeline(items, ...stages) runs each item through stages sequentially, while different items may run concurrently. Each stage receives (previousValue, originalItem, index).\n- For workflow, every agent() call should include a unique short label option, 2-5 words, such as { label: 'repo inventory' } or { label: 'source modules' }; unique labels make live status and error reporting readable.\n- For workflow, use low concurrency and agentRetries for unstable provider/transport fan-out runs; retries apply only to recoverable agent failures and still require explicit null handling after exhaustion.\n- For workflow, failed agent(), parallel(), or pipeline() branches return null and log the failure unless the workflow is aborted. Check for nulls before synthesizing conclusions.\n- For workflow, include a final synthesis/assertion agent when combining multiple subagent results; return a compact JSON-serializable value with ok/verdict plus the important outputs.\n- For workflow, the default quality shape for fan-out work is finder -> verify -> merge: run one agent per angle or work-unit (in parallel), pass each candidate finding through verify() and drop the unconfirmed, then a single synthesis agent that de-duplicates, ranks by confidence/severity, and caps the output. If nothing survives verification, return an empty result and say so rather than padding.\n- For workflow, give each subagent a substantive, self-contained task: do not spawn an agent just to read one file or run one command, and do not use one agent only to check on another. Prefer fewer, higher-level agents over many trivial micro-tasks.\n- For workflow, if agent() needs machine-readable output, pass a plain JSON Schema via opts.schema; agent() will return the validated object. Use JSON Schema syntax, not TypeScript or TypeBox constructors.\n- For workflow, the user configures per-tier models (/workflows-models), so TAG EVERY agent with opts.tier by role so those models are actually used. opts.tier accepts 'small', 'medium', or 'big' and is enforced at runtime. Small tier: lightweight exploration/search/inventory agents. Medium tier: balanced analysis agents. Big tier: synthesis/judgment/decision agents spanning the full context. An agent with no opts.tier and no opts.model falls back to the user's medium tier; do not rely on that — tag agents explicitly so small/big are used where they fit. If the user named a specific model, use opts.model with that exact provider/id; opts.model always takes precedence over opts.tier. Exact model specs may include Pi CLI-style thinking suffixes such as openai-codex/gpt-5.5:xhigh or anthropic/claude-fable-5:max when the user requests a specific effort level. The user's currently available models (route only to these) are: minimax/MiniMax-M2.7, minimax/MiniMax-M2.7-highspeed, minimax/MiniMax-M3, minimax-cn/MiniMax-M2.7, minimax-cn/MiniMax-M2.7-highspeed, minimax-cn/MiniMax-M3, openai/gpt-4, openai/gpt-4-turbo, openai/gpt-4.1, openai/gpt-4.1-mini, openai/gpt-4.1-nano, openai/gpt-4o, openai/gpt-4o-2024-05-13, openai/gpt-4o-2024-08-06, openai/gpt-4o-2024-11-20, openai/gpt-4o-mini, openai/gpt-5, openai/gpt-5-chat-latest, openai/gpt-5-codex, openai/gpt-5-mini, openai/gpt-5-nano, openai/gpt-5-pro, openai/gpt-5.1, openai/gpt-5.1-chat-latest, openai/gpt-5.1-codex, openai/gpt-5.1-codex-max, openai/gpt-5.1-codex-mini, openai/gpt-5.2, openai/gpt-5.2-chat-latest, openai/gpt-5.2-codex, openai/gpt-5.2-pro, openai/gpt-5.3-chat-latest, openai/gpt-5.3-codex, openai/gpt-5.3-codex-spark, openai/gpt-5.4, openai/gpt-5.4-mini, openai/gpt-5.4-nano, openai/gpt-5.4-pro, openai/gpt-5.5, openai/gpt-5.5-pro, openai/gpt-5.6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-realtime-2.1, openai/o1, openai/o1-pro, openai/o3, openai/o3-deep-research, openai/o3-mini, openai/o3-pro, openai/o4-mini, openai/o4-mini-deep-research, openrouter/ai21/jamba-large-1.7, openrouter/aion-labs/aion-2.0, openrouter/aion-labs/aion-3.0, openrouter/aion-labs/aion-3.0-mini, openrouter/amazon/nova-2-lite-v1, openrouter/amazon/nova-lite-v1, openrouter/amazon/nova-micro-v1, openrouter/amazon/nova-premier-v1, openrouter/amazon/nova-pro-v1, openrouter/anthropic/claude-3-haiku, openrouter/anthropic/claude-fable-5, openrouter/anthropic/claude-haiku-4.5, openrouter/anthropic/claude-opus-4, openrouter/anthropic/claude-opus-4.1, openrouter/anthropic/claude-opus-4.5, openrouter/anthropic/claude-opus-4.6, openrouter/anthropic/claude-opus-4.7, openrouter/anthropic/claude-opus-4.7-fast, openrouter/anthropic/claude-opus-4.8, openrouter/anthropic/claude-opus-4.8-fast, openrouter/anthropic/claude-sonnet-4, openrouter/anthropic/claude-sonnet-4.5, openrouter/anthropic/claude-sonnet-4.6, openrouter/anthropic/claude-sonnet-5, openrouter/arcee-ai/trinity-large-thinking, openrouter/arcee-ai/virtuoso-large, openrouter/auto, openrouter/bytedance-seed/seed-1.6, openrouter/bytedance-seed/seed-1.6-flash, openrouter/bytedance-seed/seed-2.0-lite, openrouter/bytedance-seed/seed-2.0-mini, openrouter/cohere/command-r-08-2024, openrouter/cohere/command-r-plus-08-2024, openrouter/cohere/north-mini-code:free, openrouter/deepseek/deepseek-chat, openrouter/deepseek/deepseek-chat-v3-0324, openrouter/deepseek/deepseek-chat-v3.1, openrouter/deepseek/deepseek-r1, openrouter/deepseek/deepseek-r1-0528, openrouter/deepseek/deepseek-v3.1-terminus, openrouter/deepseek/deepseek-v3.2, openrouter/deepseek/deepseek-v3.2-exp, openrouter/deepseek/deepseek-v4-flash, openrouter/deepseek/deepseek-v4-pro, openrouter/google/gemini-2.5-flash, openrouter/google/gemini-2.5-flash-lite, openrouter/google/gemini-2.5-pro, openrouter/google/gemini-2.5-pro-preview, openrouter/google/gemini-2.5-pro-preview-05-06, openrouter/google/gemini-3-flash-preview, openrouter/google/gemini-3-pro-image, openrouter/google/gemini-3.1-flash-lite, openrouter/google/gemini-3.1-flash-lite-preview, openrouter/google/gemini-3.1-pro-preview, openrouter/google/gemini-3.1-pro-preview-customtools, openrouter/google/gemini-3.5-flash, openrouter/google/gemma-3-12b-it, openrouter/google/gemma-3-27b-it, openrouter/google/gemma-4-26b-a4b-it, openrouter/google/gemma-4-26b-a4b-it:free, openrouter/google/gemma-4-31b-it, openrouter/google/gemma-4-31b-it:free, openrouter/ibm-granite/granite-4.1-8b, openrouter/inception/mercury-2, openrouter/inclusionai/ling-2.6-1t, openrouter/inclusionai/ling-2.6-flash, openrouter/inclusionai/ring-2.6-1t, openrouter/kwaipilot/kat-coder-air-v2.5, openrouter/kwaipilot/kat-coder-pro-v2, openrouter/kwaipilot/kat-coder-pro-v2.5, openrouter/meta-llama/llama-3.1-70b-instruct, openrouter/meta-llama/llama-3.1-8b-instruct, openrouter/meta-llama/llama-3.3-70b-instruct, openrouter/meta-llama/llama-3.3-70b-instruct:free, openrouter/meta-llama/llama-4-maverick, openrouter/meta-llama/llama-4-scout, openrouter/meta/muse-spark-1.1, openrouter/minimax/minimax-m1, openrouter/minimax/minimax-m2, openrouter/minimax/minimax-m2.1, openrouter/minimax/minimax-m2.5, openrouter/minimax/minimax-m2.7, openrouter/minimax/minimax-m3, openrouter/mistralai/codestral-2508, openrouter/mistralai/devstral-2512, openrouter/mistralai/ministral-14b-2512, openrouter/mistralai/ministral-3b-2512, openrouter/mistralai/ministral-8b-2512, openrouter/mistralai/mistral-large, openrouter/mistralai/mistral-large-2407, openrouter/mistralai/mistral-large-2512, openrouter/mistralai/mistral-medium-3, openrouter/mistralai/mistral-medium-3-5, openrouter/mistralai/mistral-medium-3.1, openrouter/mistralai/mistral-nemo, openrouter/mistralai/mistral-saba, openrouter/mistralai/mistral-small-2603, openrouter/mistralai/mistral-small-3.2-24b-instruct, openrouter/mistralai/mixtral-8x22b-instruct, openrouter/mistralai/voxtral-small-24b-2507, openrouter/moonshotai/kimi-k2, openrouter/moonshotai/kimi-k2-0905, openrouter/moonshotai/kimi-k2-thinking, openrouter/moonshotai/kimi-k2.5, openrouter/moonshotai/kimi-k2.6, openrouter/moonshotai/kimi-k2.7-code, openrouter/moonshotai/kimi-k3, openrouter/nex-agi/nex-n2-mini, openrouter/nex-agi/nex-n2-pro, openrouter/nvidia/llama-3.3-nemotron-super-49b-v1.5, openrouter/nvidia/nemotron-3-nano-30b-a3b, openrouter/nvidia/nemotron-3-nano-30b-a3b:free, openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free, openrouter/nvidia/nemotron-3-super-120b-a12b, openrouter/nvidia/nemotron-3-super-120b-a12b:free, openrouter/nvidia/nemotron-3-ultra-550b-a55b, openrouter/nvidia/nemotron-3-ultra-550b-a55b:free, openrouter/nvidia/nemotron-nano-12b-v2-vl:free, openrouter/nvidia/nemotron-nano-9b-v2:free, openrouter/openai/gpt-3.5-turbo, openrouter/openai/gpt-3.5-turbo-0613, openrouter/openai/gpt-3.5-turbo-16k, openrouter/openai/gpt-4, openrouter/openai/gpt-4-turbo, openrouter/openai/gpt-4-turbo-preview, openrouter/openai/gpt-4.1, openrouter/openai/gpt-4.1-mini, openrouter/openai/gpt-4.1-nano, openrouter/openai/gpt-4o, openrouter/openai/gpt-4o-2024-05-13, openrouter/openai/gpt-4o-2024-08-06, openrouter/openai/gpt-4o-2024-11-20, openrouter/openai/gpt-4o-mini, openrouter/openai/gpt-4o-mini-2024-07-18, openrouter/openai/gpt-5, openrouter/openai/gpt-5-codex, openrouter/openai/gpt-5-mini, openrouter/openai/gpt-5-nano, openrouter/openai/gpt-5-pro, openrouter/openai/gpt-5.1, openrouter/openai/gpt-5.1-chat, openrouter/openai/gpt-5.1-codex, openrouter/openai/gpt-5.1-codex-max, openrouter/openai/gpt-5.1-codex-mini, openrouter/openai/gpt-5.2, openrouter/openai/gpt-5.2-chat, openrouter/openai/gpt-5.2-codex, openrouter/openai/gpt-5.2-pro, openrouter/openai/gpt-5.3-chat, openrouter/openai/gpt-5.3-codex, openrouter/openai/gpt-5.4, openrouter/openai/gpt-5.4-mini, openrouter/openai/gpt-5.4-nano, openrouter/openai/gpt-5.4-pro, openrouter/openai/gpt-5.5, openrouter/openai/gpt-5.5-pro, openrouter/openai/gpt-5.6-luna, openrouter/openai/gpt-5.6-luna-pro, openrouter/openai/gpt-5.6-sol, openrouter/openai/gpt-5.6-sol-pro, openrouter/openai/gpt-5.6-terra, openrouter/openai/gpt-5.6-terra-pro, openrouter/openai/gpt-audio, openrouter/openai/gpt-audio-mini, openrouter/openai/gpt-chat-latest, openrouter/openai/gpt-oss-120b, openrouter/openai/gpt-oss-20b, openrouter/openai/gpt-oss-20b:free, openrouter/openai/gpt-oss-safeguard-20b, openrouter/openai/o1, openrouter/openai/o3, openrouter/openai/o3-deep-research, openrouter/openai/o3-mini, openrouter/openai/o3-mini-high, openrouter/openai/o3-pro, openrouter/openai/o4-mini, openrouter/openai/o4-mini-deep-research, openrouter/openai/o4-mini-high, openrouter/openrouter/auto, openrouter/openrouter/free, openrouter/openrouter/fusion, openrouter/poolside/laguna-m.1, openrouter/poolside/laguna-m.1:free, openrouter/poolside/laguna-xs-2.1, openrouter/poolside/laguna-xs-2.1:free, openrouter/qwen/qwen-2.5-72b-instruct, openrouter/qwen/qwen-2.5-7b-instruct, openrouter/qwen/qwen-plus, openrouter/qwen/qwen-plus-2025-07-28, openrouter/qwen/qwen-plus-2025-07-28:thinking, openrouter/qwen/qwen3-14b, openrouter/qwen/qwen3-235b-a22b, openrouter/qwen/qwen3-235b-a22b-2507, openrouter/qwen/qwen3-235b-a22b-thinking-2507, openrouter/qwen/qwen3-30b-a3b, openrouter/qwen/qwen3-30b-a3b-instruct-2507, openrouter/qwen/qwen3-30b-a3b-thinking-2507, openrouter/qwen/qwen3-32b, openrouter/qwen/qwen3-8b, openrouter/qwen/qwen3-coder, openrouter/qwen/qwen3-coder-30b-a3b-instruct, openrouter/qwen/qwen3-coder-flash, openrouter/qwen/qwen3-coder-next, openrouter/qwen/qwen3-coder-plus, openrouter/qwen/qwen3-coder:free, openrouter/qwen/qwen3-max, openrouter/qwen/qwen3-max-thinking, openrouter/qwen/qwen3-next-80b-a3b-instruct, openrouter/qwen/qwen3-next-80b-a3b-instruct:free, openrouter/qwen/qwen3-next-80b-a3b-thinking, openrouter/qwen/qwen3-vl-235b-a22b-instruct, openrouter/qwen/qwen3-vl-235b-a22b-thinking, openrouter/qwen/qwen3-vl-30b-a3b-instruct, openrouter/qwen/qwen3-vl-30b-a3b-thinking, openrouter/qwen/qwen3-vl-32b-instruct, openrouter/qwen/qwen3-vl-8b-instruct, openrouter/qwen/qwen3-vl-8b-thinking, openrouter/qwen/qwen3.5-122b-a10b, openrouter/qwen/qwen3.5-27b, openrouter/qwen/qwen3.5-35b-a3b, openrouter/qwen/qwen3.5-397b-a17b, openrouter/qwen/qwen3.5-9b, openrouter/qwen/qwen3.5-flash-02-23, openrouter/qwen/qwen3.5-plus-02-15, openrouter/qwen/qwen3.5-plus-20260420, openrouter/qwen/qwen3.6-27b, openrouter/qwen/qwen3.6-35b-a3b, openrouter/qwen/qwen3.6-flash, openrouter/qwen/qwen3.6-max-preview, openrouter/qwen/qwen3.6-plus, openrouter/qwen/qwen3.7-max, openrouter/qwen/qwen3.7-plus, openrouter/rekaai/reka-edge, openrouter/relace/relace-search, openrouter/sakana/fugu-ultra, openrouter/sao10k/l3.1-euryale-70b, openrouter/stepfun/step-3.5-flash, openrouter/stepfun/step-3.7-flash, openrouter/tencent/hy3, openrouter/tencent/hy3-preview, openrouter/tencent/hy3:free, openrouter/thedrummer/unslopnemo-12b, openrouter/upstage/solar-pro-3, openrouter/x-ai/grok-4.20, openrouter/x-ai/grok-4.3, openrouter/x-ai/grok-4.5, openrouter/x-ai/grok-build-0.1, openrouter/xiaomi/mimo-v2.5, openrouter/xiaomi/mimo-v2.5-pro, openrouter/z-ai/glm-4.5, openrouter/z-ai/glm-4.5-air, openrouter/z-ai/glm-4.5v, openrouter/z-ai/glm-4.6, openrouter/z-ai/glm-4.6v, openrouter/z-ai/glm-4.7, openrouter/z-ai/glm-4.7-flash, openrouter/z-ai/glm-5, openrouter/z-ai/glm-5-turbo, openrouter/z-ai/glm-5.1, openrouter/z-ai/glm-5.2, openrouter/z-ai/glm-5v-turbo, openrouter/~anthropic/claude-fable-latest, openrouter/~anthropic/claude-haiku-latest, openrouter/~anthropic/claude-opus-latest, openrouter/~anthropic/claude-sonnet-latest, openrouter/~google/gemini-flash-latest, openrouter/~google/gemini-pro-latest, openrouter/~moonshotai/kimi-latest, openrouter/~openai/gpt-latest, openrouter/~openai/gpt-mini-latest, openrouter/~x-ai/grok-latest, xai/grok-3, xai/grok-3-fast, xai/grok-4.20-0309-non-reasoning, xai/grok-4.20-0309-reasoning, xai/grok-4.3, xai/grok-4.5, xai/grok-build-0.1, xai/grok-code-fast-1, minimax/your-model-id.\n- For workflow, opts.agentType routes an agent to a named definition that binds its tools, model, and role prompt. Available agentTypes: background-reviewer (Review in the background), budgeted-reviewer (Review with a budget), child-tool-user (Uses child tools), scout (Fast recon), delegate (Delegate helper), test-runner (Run tests). An explicit opts.model still overrides the definition's model.\n- For workflow, do not assume the parent assistant has repository code context inside subagents; include enough task context and relevant paths in each agent prompt.\n- For workflow, runs are background by default: the tool returns immediately with a run ID, the turn ends so the user isn't blocked, and the result is delivered back into the conversation when the run finishes. Pass background: false only when you must use the result inline in this same turn (it will block).\n- For workflow, you may call `await workflow('saved-name', argsObject)` to run a saved workflow inline and use its result; nesting is one level deep only, and the global 16-concurrent / 1000-total caps hold across the nesting.\n- Use ask_user_question whenever the user's request is underspecified and you cannot proceed without concrete decisions — you can ask up to 4 questions per invocation.\n- Each question MUST have 2-4 options. Every option requires a concise label (1-5 words) and a description explaining what the choice means or its trade-offs. The user can additionally type a custom answer (\"Type something.\" row is appended automatically to single-select questions) or pick \"Chat about this\" to abandon the questionnaire.\n- Set multiSelect: true when multiple answers are valid; this suppresses the \"Type something.\" row. Provide an options[].preview markdown string when an option benefits from richer side-by-side context (mockups, code snippets, diagrams, configs) — single-select only. NOTE: any non-empty preview on a single-select question ALSO suppresses the \"Type something.\" row (no room in the side-by-side layout); \"Chat about this\" remains the escape hatch. If you recommend a specific option, make it the first option and append \"(Recommended)\" to its label.\n- Do not stack multiple ask_user_question calls back-to-back — group all clarifying questions into one invocation.\n- Be concise in your responses\n- Show file paths clearly when working with files\n\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: F:\\Project\\agent\\general\\pi-repo\\pi\\packages\\coding-agent\\README.md\n- Additional docs: F:\\Project\\agent\\general\\pi-repo\\pi\\packages\\coding-agent\\docs\n- Examples: F:\\Project\\agent\\general\\pi-repo\\pi\\packages\\coding-agent\\examples (extensions, custom tools, SDK)\n- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)\n\nThe following skills provide specialized instructions for specific tasks.\nUse the read tool to load a skill's file when the task matches its description.\nWhen a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n<available_skills>\n  <skill>\n    <name>add-llm-provider</name>\n    <description>Checklist for adding a new LLM provider to packages/ai. Covers core types, provider implementation, lazy registration, model generation, the full test matrix, coding-agent wiring, and docs.</description>\n    <location>F:\\Project\\vibeCoding\\starfire\\.pi\\skills\\add-llm-provider.md</location>\n  </skill>\n  <skill>\n    <name>create-skill</name>\n    <description>Guide for creating effective skills following best practices. Use when creating or updating skills that extend agent capabilities.</description>\n    <location>C:\\Users\\jingc\\.agents\\skills\\create-skill\\SKILL.md</location>\n  </skill>\n  <skill>\n    <name>find-skills</name>\n    <description>Helps users discover and install agent skills when they ask questions like &quot;how do I do X&quot;, &quot;find a skill for X&quot;, &quot;is there a skill that can...&quot;, or express interest in extending capabilities. This skill should be used when the user is looking for functionality that might exist as an installable skill.</description>\n    <location>C:\\Users\\jingc\\.agents\\skills\\find-skills\\SKILL.md</location>\n  </skill>\n  <skill>\n    <name>pi-subagents</name>\n    <description>Delegate work to builtin or custom subagents with single-agent, chain,\nparallel, async, forked-context, and intercom-coordinated workflows. Use\nfor advisory review, implementation handoffs, and multi-step tasks where a\nsingle agent should stay in control while other agents contribute context,\nplanning, or execution.\n</description>\n    <location>F:\\Project\\agent\\general\\pi-repo\\pi-subagents\\skills\\pi-subagents\\SKILL.md</location>\n  </skill>\n  <skill>\n    <name>librarian</name>\n    <description>Research open-source libraries with evidence-backed answers and GitHub permalinks. Use when the user asks about library internals, needs implementation details with source code references, wants to understand why something was changed, or needs authoritative answers backed by actual code. Excels at navigating large open-source repos and providing citations to exact lines of code.</description>\n    <location>F:\\Project\\agent\\general\\pi-repo\\pi-web-access\\skills\\librarian\\SKILL.md</location>\n  </skill>\n</available_skills>\nCurrent date: 2026-07-20\nCurrent working directory: F:/Project/vibeCoding/starfire"
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "hi"
+        }
+      ]
+    }
+  ],
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "store": false,
+  "max_completion_tokens": 4096,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read",
+        "description": "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+        "parameters": {
+          "type": "object",
+          "required": [
+            "path"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Path to the file to read (relative or absolute)"
+            },
+            "offset": {
+              "type": "number",
+              "description": "Line number to start reading from (1-indexed)"
+            },
+            "limit": {
+              "type": "number",
+              "description": "Maximum number of lines to read"
+            }
+          }
+        },
+        "strict": false
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "bash",
+        "description": "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
+        "parameters": {
+          "type": "object",
+          "required": [
+            "command"
+          ],
+          "properties": {
+            "command": {
+              "type": "string",
+              "description": "Bash command to execute"
+            },
+            "timeout": {
+              "type": "number",
+              "description": "Timeout in seconds (optional, no default timeout)"
+            }
+          }
+        },
+        "strict": false
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "edit",
+        "description": "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
+        "parameters": {
+          "type": "object",
+          "required": [
+            "path",
+            "edits"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Path to the file to edit (relative or absolute)"
+            },
+            "edits": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "oldText",
+                  "newText"
+                ],
+                "properties": {
+                  "oldText": {
+                    "type": "string",
+                    "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."
+                  },
+                  "newText": {
+                    "type": "string",
+                    "description": "Replacement text for this targeted edit."
+                  }
+                }
+              },
+              "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead."
+            }
+          }
+        },
+        "strict": false
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "write",
+        "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
+        "parameters": {
+          "type": "object",
+          "required": [
+            "path",
+            "content"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Path to the file to write (relative or absolute)"
+            },
+            "content": {
+              "type": "string",
+              "description": "Content to write to the file"
+            }
+          }
+        },
+        "strict": false
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "subagent",
+        "description": "Delegate to subagents or manage agent definitions.\n\nEXECUTION (use exactly ONE mode):\n• Before executing, use { action: \"list\" } to inspect configured agents/chains. Only execute agents listed as executable/non-disabled.\n• SINGLE: { agent, task? } - one task; omit task for self-contained agents\n• CHAIN: { chain: [{agent:\"agent-a\"}, {parallel:[{agent:\"agent-b\",count:3}]}] } - sequential pipeline with optional parallel fan-out\n• PARALLEL: { tasks: [{agent,task,count?,output?,reads?,progress?}, ...], concurrency?: number, worktree?: true } - concurrent execution (worktree: isolate each task in a git worktree)\n• Optional context: { context: \"fresh\" | \"fork\" } (explicit value overrides every child; when omitted, each requested agent uses its own defaultContext, otherwise \"fresh\"; inspect agent defaults via { action: \"list\" })\n• Optional timeout: { timeoutMs } or { maxRuntimeMs } sets a run-level max runtime for foreground and async/background runs\n• If { action: \"list\" } shows proactive skill subagent suggestions, consider a small fresh-context fanout for broad tasks where one of those skills would materially help\n\nCHAIN TEMPLATE VARIABLES (use in task strings):\n• {task} - The original task/request from the user\n• {previous} - Text response from the previous step (empty for first step)\n• {chain_dir} - Shared directory for chain files (e.g., <tmpdir>/pi-subagents-<scope>/chain-runs/abc123/)\n\nCHAIN EXAMPLES (quick reference for the nested schema):\n• Sequential: { chain: [{agent:\"agent-a\", task:\"Analyze {task}\"}, {agent:\"agent-b\", task:\"Plan based on {previous}\"}] }\n• Parallel fan-out: { chain: [{parallel: [{agent:\"agent-a\", task:\"Check part of {task}\", count: 3}]}] }\n• Mixed: { chain: [{agent:\"agent-a\", task:\"Research {task}\"}, {parallel: [{agent:\"agent-b\", task:\"Review {previous}\", count: 2}]}, {agent:\"agent-c\", task:\"Summarize {previous}\"}] }\n\nMANAGEMENT (use action field, omit agent/task/chain/tasks):\n• { action: \"list\" } - discover executable agents/chains\n• { action: \"get\", agent: \"name\" } - full detail; packaged agents use dotted runtime names like \"package.agent\"\n• { action: \"models\", agent?: \"name\" } - show the runtime-loaded builtin subagent model mapping, optionally filtered to one builtin\n• { action: \"watchdog.status\" | \"watchdog.check\" | \"watchdog.recommend-model\" } - inspect the opt-in subagent watchdog and its strong complementary model recommendation\n• { action: \"watchdog.configure\", model: \"recommended\" | \"inherit\" | \"provider/model[:thinking]\", scope?: \"session\" | \"user\" | \"project\", target?: \"main\" | \"children\" | \"child\", agent?: \"name\", thinking?: \"inherit\" | \"off\" | \"minimal\" | \"low\" | \"medium\" | \"high\" | \"xhigh\" } - configure watchdog model selection; default scope is session, use persistent scopes only when the user asks\n• { action: \"create\", config: { name: \"custom-agent\", package: \"code-analysis\", systemPrompt, systemPromptMode, inheritProjectContext, inheritSkills, defaultContext, acceptance, ... } }\n• { action: \"update\", agent: \"code-analysis.custom-agent\", config: { package: \"analysis\", ... } } - merge\n• { action: \"delete\", agent: \"code-analysis.custom-agent\" }\n• { action: \"eject\", agent: \"reviewer\", agentScope?: \"user\" | \"project\" } - copy a bundled/package agent to user/project scope as an editable custom file that shadows the original (default scope: user)\n• { action: \"disable\", agent: \"reviewer\", agentScope?: \"user\" | \"project\" } - hide any agent from runtime discovery via a reversible settings override (default scope: user)\n• { action: \"enable\", agent: \"reviewer\", agentScope?: \"user\" | \"project\" } - remove a disabled override and restore discovery\n• { action: \"reset\", agent: \"reviewer\", agentScope?: \"user\" | \"project\" } - delete the scope's custom agent file and/or settings override, restoring the bundled default\n• Use chainName for chain operations; packaged chains also use dotted runtime names\n\nCONTROL:\n• { action: \"status\", id: \"...\" } - inspect an async/background run by id or prefix\n• { action: \"status\", view: \"fleet\" } - read-only active foreground/async fleet view with transcript commands\n• { action: \"status\", id: \"...\", view: \"transcript\", index?: 0, lines?: 80 } - tail a run or child output/session transcript\n• { action: \"interrupt\", id?: \"...\" } - soft-interrupt the current child turn and leave the run paused\n• { action: \"stop\", id: \"...\" } - stop a current-session top-level async run; stopped runs finish with state \"stopped\"\n• { action: \"resume\", id: \"...\", message: \"...\", index?: 0 } - interrupt then follow up with a live async child, or revive a completed async/foreground child from its session\n• { action: \"steer\", id: \"...\", message: \"...\", index?: 0 } - queue non-terminal guidance for a live/queued async Pi child when supported\n• { action: \"append-step\", id: \"...\", chain: [{agent:\"agent-c\", task:\"Use {previous}\"}] } - append one step to the tail of a running async chain\n\nSCHEDULE (opt-in; requires { \"scheduledRuns\": { \"enabled\": true } } in config.json):\n• { action: \"schedule\", agent, task?, schedule: \"+10m\" | \"2030-01-01T09:00:00Z\", scheduleName? } - defer a subagent launch until a future time. Also accepts tasks[] or chain[]. Scheduled runs always launch async with fresh context; they become normal tracked async runs once they fire. Only schedule explicit delayed runs the user asked for.\n• { action: \"schedule-list\" } - list scheduled runs for this session\n• { action: \"schedule-status\", id: \"...\" } - inspect one scheduled run\n• { action: \"schedule-cancel\", id: \"...\" } - cancel a scheduled run before it fires\n\nDIAGNOSTICS:\n• { action: \"doctor\" } - read-only report for runtime paths, discovery, sessions, and intercom\n\nSAFETY-CRITICAL SUBAGENT GUIDANCE:\n• Use { action: \"list\" } before execution and only run executable/non-disabled agents or chains.\n• Keep execution and management separate: omit action for SINGLE/PARALLEL/CHAIN execution; use action only for list/get/models/create/update/delete/status/interrupt/stop/resume/append-step/doctor.\n• Async/background runs: launch with async:true only when work can proceed independently. Do not sleep or poll status just to wait; if this turn must block, use subagent_wait. Otherwise continue useful work or respond and let completion notifications arrive.\n• Child-safety boundary: ordinary child subagents are not orchestrators and must not run subagents. Only explicitly configured fanout children may use the child-safe subagent tool, still bounded by depth/session limits.\n• Writing/review safety: keep one writer for the same cwd/worktree. Use fresh-context read-only reviewers/validators for independent review, then have the parent synthesize and apply fixes as the sole writer unless an isolated worktree was intentionally requested.\n• Artifacts/status essentials: chain outputs live under {chain_dir}; async runs expose asyncId/asyncDir with status.json, events.jsonl, output logs, and status via { action: \"status\", id }. Include output paths and residual risks when reporting results.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "agent": {
+              "type": "string",
+              "description": "Agent name (SINGLE mode) or target for management get/update/delete"
+            },
+            "task": {
+              "type": "string",
+              "description": "Task (SINGLE mode, optional for self-contained agents)"
+            },
+            "action": {
+              "type": "string",
+              "description": "Management/control action only. Must be omitted for execution mode (single, parallel, or chain)."
+            },
+            "id": {
+              "type": "string",
+              "description": "Run id or prefix for action='status', action='interrupt', action='stop', action='resume', action='steer', or action='append-step'."
+            },
+            "runId": {
+              "type": "string",
+              "description": "Target run ID for action='interrupt', action='stop', action='resume', action='steer', or action='append-step'. Prefer id for new calls."
+            },
+            "dir": {
+              "type": "string",
+              "description": "Async run directory for action='status', action='stop', action='resume', or action='steer'."
+            },
+            "index": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Zero-based child index for actions that target a specific child or transcript."
+            },
+            "view": {
+              "type": "string",
+              "enum": [
+                "fleet",
+                "transcript"
+              ],
+              "description": "Optional status view. Use view='fleet' for a read-only active foreground/async fleet surface, or view='transcript' with id/dir (and optional index) to tail a run transcript."
+            },
+            "lines": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "description": "Maximum transcript lines for action='status', view='transcript'. Defaults to 80."
+            },
+            "message": {
+              "type": "string",
+              "description": "Follow-up message for action='resume' or non-terminal guidance for action='steer'. Use index to choose a child from multi-child runs."
+            },
+            "scope": {
+              "type": "string",
+              "enum": [
+                "session",
+                "user",
+                "project"
+              ],
+              "description": "Scope for action='watchdog.configure'. Defaults to session to avoid persistent settings writes unless user/project is explicit."
+            },
+            "target": {
+              "type": "string",
+              "enum": [
+                "main",
+                "children",
+                "child"
+              ],
+              "description": "Target for action='watchdog.configure'. Defaults to main. Use target='child' with agent for a per-agent child watchdog override."
+            },
+            "thinking": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "boolean",
+                  "enum": [
+                    false
+                  ]
+                }
+              ],
+              "description": "Thinking level for action='watchdog.configure' (off/minimal/low/medium/high/xhigh, inherit, or false for off)."
+            },
+            "schedule": {
+              "type": "string",
+              "description": "Explicit one-shot schedule for action='schedule'. Only honored when scheduledRuns.enabled is true. Use '+10m' or a future ISO timestamp with timezone; scheduled runs always launch async with fresh context."
+            },
+            "scheduleName": {
+              "type": "string",
+              "description": "Optional display name for action='schedule'."
+            },
+            "chainName": {
+              "type": "string",
+              "description": "Chain name for get/update/delete management actions"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": true
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "description": "Agent/chain config for create/update. Object or JSON string; presence of steps creates a chain."
+            },
+            "tasks": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "agent",
+                  "task"
+                ],
+                "properties": {
+                  "agent": {
+                    "type": "string"
+                  },
+                  "task": {
+                    "type": "string"
+                  },
+                  "cwd": {
+                    "type": "string"
+                  },
+                  "count": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "output": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "boolean"
+                      }
+                    ]
+                  },
+                  "outputMode": {
+                    "type": "string",
+                    "enum": [
+                      "inline",
+                      "file-only"
+                    ]
+                  },
+                  "reads": {
+                    "anyOf": [
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      {
+                        "type": "boolean"
+                      }
+                    ]
+                  },
+                  "progress": {
+                    "type": "boolean"
+                  },
+                  "model": {
+                    "type": "string"
+                  },
+                  "skill": {
+                    "anyOf": [
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "toolBudget": {
+                    "type": "object",
+                    "required": [
+                      "hard"
+                    ],
+                    "properties": {
+                      "soft": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "hard": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "block": {
+                        "anyOf": [
+                          {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          {
+                            "type": "string",
+                            "enum": [
+                              "*"
+                            ]
+                          }
+                        ]
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "acceptance": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "enum": [
+                          "auto",
+                          "attested",
+                          "checked",
+                          "verified",
+                          "reviewed"
+                        ]
+                      },
+                      {
+                        "type": "boolean",
+                        "enum": [
+                          false
+                        ]
+                      },
+                      {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    ]
+                  }
+                }
+              },
+              "description": "PARALLEL mode: [{agent, task, count?, output?, outputMode?, reads?, progress?}, ...]"
+            },
+            "concurrency": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Top-level PARALLEL mode only: max concurrent tasks. Defaults to config.parallel.concurrency or 4."
+            },
+            "worktree": {
+              "type": "boolean",
+              "description": "Create isolated git worktrees for parallel tasks; requires clean git state."
+            },
+            "chain": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "agent": {
+                    "type": "string"
+                  },
+                  "task": {
+                    "type": "string"
+                  },
+                  "phase": {
+                    "type": "string"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "as": {
+                    "type": "string"
+                  },
+                  "outputSchema": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "cwd": {
+                    "type": "string"
+                  },
+                  "output": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "boolean"
+                      }
+                    ]
+                  },
+                  "outputMode": {
+                    "type": "string",
+                    "enum": [
+                      "inline",
+                      "file-only"
+                    ]
+                  },
+                  "reads": {
+                    "anyOf": [
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      {
+                        "type": "boolean"
+                      }
+                    ]
+                  },
+                  "progress": {
+                    "type": "boolean"
+                  },
+                  "skill": {
+                    "anyOf": [
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "model": {
+                    "type": "string"
+                  },
+                  "toolBudget": {
+                    "type": "object",
+                    "required": [
+                      "hard"
+                    ],
+                    "properties": {
+                      "soft": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "hard": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "block": {
+                        "anyOf": [
+                          {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          {
+                            "type": "string",
+                            "enum": [
+                              "*"
+                            ]
+                          }
+                        ]
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "acceptance": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "enum": [
+                          "auto",
+                          "attested",
+                          "checked",
+                          "verified",
+                          "reviewed"
+                        ]
+                      },
+                      {
+                        "type": "boolean",
+                        "enum": [
+                          false
+                        ]
+                      },
+                      {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    ]
+                  },
+                  "parallel": {
+                    "anyOf": [
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "required": [
+                            "agent"
+                          ],
+                          "properties": {
+                            "agent": {
+                              "type": "string"
+                            },
+                            "task": {
+                              "type": "string"
+                            },
+                            "phase": {
+                              "type": "string"
+                            },
+                            "label": {
+                              "type": "string"
+                            },
+                            "as": {
+                              "type": "string"
+                            },
+                            "outputSchema": {
+                              "type": "object",
+                              "additionalProperties": true
+                            },
+                            "cwd": {
+                              "type": "string"
+                            },
+                            "count": {
+                              "type": "integer",
+                              "minimum": 1
+                            },
+                            "output": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "boolean"
+                                }
+                              ]
+                            },
+                            "outputMode": {
+                              "type": "string",
+                              "enum": [
+                                "inline",
+                                "file-only"
+                              ]
+                            },
+                            "reads": {
+                              "anyOf": [
+                                {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                },
+                                {
+                                  "type": "boolean"
+                                }
+                              ]
+                            },
+                            "progress": {
+                              "type": "boolean"
+                            },
+                            "skill": {
+                              "anyOf": [
+                                {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                },
+                                {
+                                  "type": "boolean"
+                                },
+                                {
+                                  "type": "string"
+                                }
+                              ]
+                            },
+                            "model": {
+                              "type": "string"
+                            },
+                            "toolBudget": {
+                              "type": "object",
+                              "required": [
+                                "hard"
+                              ],
+                              "properties": {
+                                "soft": {
+                                  "type": "integer",
+                                  "minimum": 1
+                                },
+                                "hard": {
+                                  "type": "integer",
+                                  "minimum": 1
+                                },
+                                "block": {
+                                  "anyOf": [
+                                    {
+                                      "type": "array",
+                                      "minItems": 1,
+                                      "items": {
+                                        "type": "string",
+                                        "minLength": 1
+                                      }
+                                    },
+                                    {
+                                      "type": "string",
+                                      "enum": [
+                                        "*"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              },
+                              "additionalProperties": false
+                            },
+                            "acceptance": {
+                              "anyOf": [
+                                {
+                                  "type": "string",
+                                  "enum": [
+                                    "auto",
+                                    "attested",
+                                    "checked",
+                                    "verified",
+                                    "reviewed"
+                                  ]
+                                },
+                                {
+                                  "type": "boolean",
+                                  "enum": [
+                                    false
+                                  ]
+                                },
+                                {
+                                  "type": "object",
+                                  "additionalProperties": true
+                                }
+                              ]
+                            }
+                          }
+                        },
+                        "minItems": 1
+                      },
+                      {
+                        "type": "object",
+                        "required": [
+                          "agent"
+                        ],
+                        "properties": {
+                          "agent": {
+                            "type": "string"
+                          },
+                          "task": {
+                            "type": "string"
+                          },
+                          "phase": {
+                            "type": "string"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "outputSchema": {
+                            "type": "object",
+                            "additionalProperties": true
+                          },
+                          "cwd": {
+                            "type": "string"
+                          },
+                          "output": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "boolean"
+                              }
+                            ]
+                          },
+                          "outputMode": {
+                            "type": "string",
+                            "enum": [
+                              "inline",
+                              "file-only"
+                            ]
+                          },
+                          "reads": {
+                            "anyOf": [
+                              {
+                                "type": "array",
+                                "items": {
+                                  "type": "string"
+                                }
+                              },
+                              {
+                                "type": "boolean"
+                              }
+                            ]
+                          },
+                          "progress": {
+                            "type": "boolean"
+                          },
+                          "skill": {
+                            "anyOf": [
+                              {
+                                "type": "array",
+                                "items": {
+                                  "type": "string"
+                                }
+                              },
+                              {
+                                "type": "boolean"
+                              },
+                              {
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "model": {
+                            "type": "string"
+                          },
+                          "toolBudget": {
+                            "type": "object",
+                            "required": [
+                              "hard"
+                            ],
+                            "properties": {
+                              "soft": {
+                                "type": "integer",
+                                "minimum": 1
+                              },
+                              "hard": {
+                                "type": "integer",
+                                "minimum": 1
+                              },
+                              "block": {
+                                "anyOf": [
+                                  {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "items": {
+                                      "type": "string",
+                                      "minLength": 1
+                                    }
+                                  },
+                                  {
+                                    "type": "string",
+                                    "enum": [
+                                      "*"
+                                    ]
+                                  }
+                                ]
+                              }
+                            },
+                            "additionalProperties": false
+                          },
+                          "acceptance": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "enum": [
+                                  "auto",
+                                  "attested",
+                                  "checked",
+                                  "verified",
+                                  "reviewed"
+                                ]
+                              },
+                              {
+                                "type": "boolean",
+                                "enum": [
+                                  false
+                                ]
+                              },
+                              {
+                                "type": "object",
+                                "additionalProperties": true
+                              }
+                            ]
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "expand": {
+                    "type": "object",
+                    "required": [
+                      "from"
+                    ],
+                    "properties": {
+                      "from": {
+                        "type": "object",
+                        "required": [
+                          "output",
+                          "path"
+                        ],
+                        "properties": {
+                          "output": {
+                            "type": "string"
+                          },
+                          "path": {
+                            "type": "string"
+                          }
+                        },
+                        "additionalProperties": false
+                      },
+                      "item": {
+                        "type": "string"
+                      },
+                      "key": {
+                        "type": "string"
+                      },
+                      "maxItems": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "onEmpty": {
+                        "type": "string",
+                        "enum": [
+                          "skip",
+                          "fail"
+                        ]
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "collect": {
+                    "type": "object",
+                    "required": [
+                      "as"
+                    ],
+                    "properties": {
+                      "as": {
+                        "type": "string"
+                      },
+                      "outputSchema": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "concurrency": {
+                    "type": "number"
+                  },
+                  "failFast": {
+                    "type": "boolean"
+                  },
+                  "worktree": {
+                    "type": "boolean"
+                  }
+                },
+                "additionalProperties": false
+              },
+              "description": "CHAIN mode: sequential steps; each result becomes {previous}. append-step takes one tail step and may use {chain_dir}/{outputs.name}."
+            },
+            "context": {
+              "type": "string",
+              "enum": [
+                "fresh",
+                "fork"
+              ],
+              "description": "'fresh' or 'fork' to branch from parent session. Explicit context overrides every child in the invocation. If omitted, each requested agent uses its own defaultContext; agents without defaultContext: 'fork' run fresh."
+            },
+            "chainDir": {
+              "type": "string",
+              "description": "Persistent chain artifact directory; defaults to user-scoped temp storage."
+            },
+            "async": {
+              "type": "boolean",
+              "description": "Run in background (default: false, or per config)"
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Optional run-level timeout in ms for foreground and async/background runs. Alias of maxRuntimeMs."
+            },
+            "maxRuntimeMs": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Alias of timeoutMs for optional run-level timeout in foreground and async/background runs."
+            },
+            "turnBudget": {
+              "type": "object",
+              "required": [
+                "maxTurns"
+              ],
+              "properties": {
+                "maxTurns": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "graceTurns": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false,
+              "description": "Optional assistant-turn budget. At maxTurns the child is asked to wrap up; after graceTurns additional assistant turns it is aborted and partial output is returned."
+            },
+            "toolBudget": {
+              "type": "object",
+              "required": [
+                "hard"
+              ],
+              "properties": {
+                "soft": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "hard": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "block": {
+                  "anyOf": [
+                    {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    {
+                      "type": "string",
+                      "enum": [
+                        "*"
+                      ]
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false,
+              "description": "Optional child tool-call budget. soft nudges the child; after hard, block tools (default read/grep/find/ls, or '*' for all tools) are blocked so the child can finalize."
+            },
+            "agentScope": {
+              "type": "string",
+              "description": "Agent discovery scope: 'user', 'project', or 'both' (default: 'both'; project wins on name collisions)"
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "artifacts": {
+              "type": "boolean",
+              "description": "Write debug artifacts (default: true)"
+            },
+            "includeProgress": {
+              "type": "boolean",
+              "description": "Include full progress in result (default: false)"
+            },
+            "share": {
+              "type": "boolean",
+              "description": "Upload session to GitHub Gist for sharing (default: false)"
+            },
+            "sessionDir": {
+              "type": "string",
+              "description": "Directory to store session logs (default: temp; enables sessions even if share=false)"
+            },
+            "clarify": {
+              "type": "boolean",
+              "description": "Show TUI to preview/edit before execution. Explicit clarify: true keeps the run foreground for the clarify UI; omitted clarify can still run in the background when async: true is set."
+            },
+            "control": {
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "needsAttentionAfterMs": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "activeNoticeAfterMs": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "activeNoticeAfterTurns": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "activeNoticeAfterTokens": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "failedToolAttemptsBeforeAttention": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "notifyOn": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "active_long_running",
+                      "needs_attention"
+                    ]
+                  }
+                },
+                "notifyChannels": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "event",
+                      "async",
+                      "intercom"
+                    ]
+                  }
+                }
+              }
+            },
+            "output": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "boolean"
+                }
+              ],
+              "description": "Output file for single agent (string), or false to disable. Relative paths resolve against cwd."
+            },
+            "outputMode": {
+              "type": "string",
+              "enum": [
+                "inline",
+                "file-only"
+              ],
+              "description": "Return saved output inline (default) or only a concise file reference. file-only requires output to be a path."
+            },
+            "skill": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "description": "Skill name(s) to make available (comma-separated), array of strings, or boolean (false disables, true uses default)"
+            },
+            "model": {
+              "type": "string",
+              "description": "Override model for single agent (e.g. 'anthropic/claude-sonnet-4')"
+            },
+            "acceptance": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "enum": [
+                    "auto",
+                    "attested",
+                    "checked",
+                    "verified",
+                    "reviewed"
+                  ]
+                },
+                {
+                  "type": "boolean",
+                  "enum": [
+                    false
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              ],
+              "description": "Optional acceptance policy. Omitted means auto-inferred; verified requires configured runtime commands. Reviewed is inferred-only because explicit runs cannot supply an independent reviewer result. Bare \"none\" requires { level: \"none\", reason: \"...\" }, while false is deprecated."
+            }
+          }
+        },
+        "strict": false
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "subagent_wait",
+        "description": "Block until background (async) subagent runs started in this session finish, then return.\n\nUse this after launching async subagents when you have no independent work left and must not end your turn — for example inside a skill that has to run to completion, or any non-interactive run (`pi -p ...`) where the whole task is a single turn and ending it would abandon the still-running children.\n\n• { } — return as soon as the FIRST active run finishes (default). Ideal for a rolling fleet: launch N, wait, spawn a replacement for the one that finished, then call subagent_wait again — keeping N in flight.\n• { all: true } — block until EVERY active run in this session is finished.\n• { id: \"...\" } — wait for one specific async run or remembered detached foreground run (id or prefix) to finish.\n• { timeoutMs: 600000 } — stop waiting after N ms (the runs keep going regardless; default 30 min)\n\nsubagent_wait also returns when a run needs attention (a child that went idle or blocked for a decision), not only on completion — so a stuck child never stalls the loop; the summary names the run(s) to inspect/nudge/resume/interrupt. It wakes the instant a completion or control event arrives (subscribed to Pi's event bus, with a poll fallback that reconciles crashed runners), keeps the turn alive for normal notification delivery, and resolves early if the turn is aborted.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "description": "Async run or remembered detached foreground run id/prefix to wait for one specific run. Omit to wait across every active async run started in this session."
+            },
+            "all": {
+              "type": "boolean",
+              "description": "Wait for ALL active runs to finish. Default false: return as soon as the first run finishes, so a fleet manager can spawn a replacement and wait again. Ignored when id targets a single run."
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Give up waiting after this many milliseconds (the runs keep going regardless). Defaults to 1800000 (30 minutes)."
+            }
+          }
+        },
+        "strict": false
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "web_search",
+        "description": "Search the web using OpenAI, Brave, Parallel, Tavily, Exa, Perplexity, or Gemini. Returns an AI-synthesized answer with source citations. OpenAI web_search uses a Codex subscription or OpenAI API key. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to \"none\" to skip curation or \"auto-summary\" for a model-generated summary without the browser curator. Provider auto-selects: OpenAI when suitable and available, then Exa, Brave, Parallel, Tavily, Perplexity, Gemini API, then Gemini Web.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Single search query. For research tasks, prefer 'queries' with multiple varied angles instead."
+            },
+            "queries": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Multiple queries searched in sequence, each returning its own synthesized answer. Prefer this for research — vary phrasing, scope, and angle across 2-4 queries to maximize coverage. Good: ['React vs Vue performance benchmarks 2026', 'React vs Vue developer experience comparison', 'React ecosystem size vs Vue ecosystem']. Bad: ['React vs Vue', 'React vs Vue comparison', 'React vs Vue review'] (too similar, redundant results)."
+            },
+            "numResults": {
+              "type": "number",
+              "description": "Results per query (default: 5, max: 20)"
+            },
+            "includeContent": {
+              "type": "boolean",
+              "description": "Fetch full page content (async)"
+            },
+            "recencyFilter": {
+              "type": "string",
+              "enum": [
+                "day",
+                "week",
+                "month",
+                "year"
+              ],
+              "description": "Filter by recency"
+            },
+            "domainFilter": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Limit to domains (prefix with - to exclude)"
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "openai",
+                "brave",
+                "parallel",
+                "tavily",
+                "exa",
+                "perplexity",
+                "gemini"
+              ],
+              "description": "Search provider (default: auto)"
+            },
+            "workflow": {
+              "type": "string",
+              "enum": [
+                "none",
+                "summary-review",
+                "auto-summary"
+              ],
+              "description": "Search workflow mode: none = no curator, summary-review = open curator with auto summary draft (default), auto-summary = generate summary without opening curator"
+            }
+          }
+        },
+        "strict": false
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "fetch_content",
+        "description": "Fetch URL(s) and extract readable content as markdown. Supports YouTube video transcripts (with thumbnail), GitHub repository contents, and local video files (with frame thumbnail). Video frames can be extracted via timestamp/range or sampled across the entire video with frames alone. Falls back to Gemini for pages that block bots or fail Readability extraction. For YouTube and video files: ALWAYS pass the user's specific question via the prompt parameter — this directs the AI to focus on that aspect of the video, producing much better results than a generic extraction. Content is always stored and can be retrieved with get_search_content.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "Single URL to fetch"
+            },
+            "urls": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Multiple URLs (parallel)"
+            },
+            "forceClone": {
+              "type": "boolean",
+              "description": "Force cloning large GitHub repositories that exceed the size threshold"
+            },
+            "prompt": {
+              "type": "string",
+              "description": "Question or instruction for video analysis (YouTube and video files). Pass the user's specific question here — e.g. 'describe the book shown at the advice for beginners section'. Without this, a generic transcript extraction is used which may miss what the user is asking about."
+            },
+            "timestamp": {
+              "type": "string",
+              "description": "Extract video frame(s) at a timestamp or time range. Single: '1:23:45', '23:45', or '85' (seconds). Range: '23:41-25:00' extracts evenly-spaced frames across that span (default 6). Use frames with ranges to control density; single+frames uses a fixed 5s interval. YouTube requires yt-dlp + ffmpeg; local videos require ffmpeg. Use a range when you know the approximate area but not the exact moment — you'll get a contact sheet to visually identify the right frame."
+            },
+            "frames": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 12,
+              "description": "Number of frames to extract. Use with timestamp range for custom density, with single timestamp to get N frames at 5s intervals, or alone to sample across the entire video. Requires yt-dlp + ffmpeg for YouTube, ffmpeg for local video."
+            },
+            "model": {
+              "type": "string",
+              "description": "Override the Gemini model for video/YouTube analysis (e.g. 'gemini-2.5-flash', 'gemini-3-flash-preview'). Defaults to config or gemini-3-flash-preview."
+            }
+          }
+        },
+        "strict": false
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_search_content",
+        "description": "Retrieve full content from a previous web_search or fetch_content call.",
+        "parameters": {
+          "type": "object",
+          "required": [
+            "responseId"
+          ],
+          "properties": {
+            "responseId": {
+              "type": "string",
+              "description": "The responseId from web_search or fetch_content"
+            },
+            "query": {
+              "type": "string",
+              "description": "Get content for this query (web_search)"
+            },
+            "queryIndex": {
+              "type": "number",
+              "description": "Get content for query at index"
+            },
+            "url": {
+              "type": "string",
+              "description": "Get content for this URL"
+            },
+            "urlIndex": {
+              "type": "number",
+              "description": "Get content for URL at index"
+            }
+          }
+        },
+        "strict": false
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "workflow",
+        "description": "Execute a deterministic JavaScript workflow that orchestrates multiple subagents with agent(), parallel(), and pipeline(). script is required raw JavaScript. It must start with export const meta = { name, description, phases? } and must call agent() at least once.",
+        "parameters": {
+          "type": "object",
+          "required": [
+            "script"
+          ],
+          "properties": {
+            "script": {
+              "type": "string",
+              "description": "Required raw JavaScript workflow script, with no Markdown fences. First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] } Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, and budget. The workflow must call agent() at least once. parallel() requires functions, not promises: await parallel(items.map(item => () => agent(...)))."
+            },
+            "args": {
+              "description": "Optional JSON value exposed to the workflow script as global `args`."
+            },
+            "background": {
+              "type": "boolean",
+              "description": "Run the workflow in the background. Default: true — the tool returns immediately with a run ID, the turn ends so the user isn't blocked, and the result is delivered back into the conversation when it finishes. Set to false only when you need the result inline in this same turn (the call will block until the workflow completes)."
+            },
+            "maxAgents": {
+              "type": "number",
+              "description": "Maximum number of agents allowed in this run. Default: 1000."
+            },
+            "concurrency": {
+              "type": "number",
+              "description": "Maximum concurrent agents for this run. Clamped to the runtime maximum. Use when provider/transport stability matters."
+            },
+            "agentRetries": {
+              "type": "number",
+              "description": "Retry attempts for recoverable agent failures such as timeout, connection failure, or empty assistant output. Default 0 unless configured."
+            },
+            "agentTimeoutMs": {
+              "type": "number",
+              "description": "Timeout per agent in milliseconds. Omit for no hard timeout by default. Set only when the user asks to bound time."
+            },
+            "tokenBudget": {
+              "type": "number",
+              "description": "Hard total-token budget for the whole run. Once spent reaches it, further agent() calls fail and the run stops. Omit for no limit. Set it when the user asks to cap spend."
+            }
+          }
+        },
+        "strict": false
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "mcp",
+        "description": "MCP gateway - connect to MCP servers and call their tools. Non-MCP Pi tools should be called directly, not through mcp.\n\nUsage:\n  mcp({ })                              → Show server status\n  mcp({ server: \"name\" })               → List tools from server\n  mcp({ search: \"query\" })              → Search MCP tools by name/description\n  mcp({ describe: \"tool_name\" })        → Show tool details and parameters\n  mcp({ connect: \"server-name\" })       → Connect to a server and refresh metadata\n  mcp({ tool: \"name\", args: '{\"key\": \"value\"}' })    → Call a tool (args is JSON string)\n  mcp({ action: \"ui-messages\" })        → Retrieve accumulated messages from completed UI sessions\n  mcp({ action: \"auth-start\", server: \"name\" })      → Start manual OAuth and get a browser URL\n  mcp({ action: \"auth-complete\", server: \"name\", args: '{\"redirectUrl\":\"...\"}' }) → Complete manual OAuth\n\nMode: action > tool (call) > connect > describe > search > server (list) > nothing (status)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "tool": {
+              "type": "string",
+              "description": "Tool name to call (e.g., 'xcodebuild_list_sims')"
+            },
+            "args": {
+              "type": "string",
+              "description": "Arguments as JSON string (e.g., '{\"key\": \"value\"}')"
+            },
+            "connect": {
+              "type": "string",
+              "description": "Server name to connect (lazy connect + metadata refresh)"
+            },
+            "describe": {
+              "type": "string",
+              "description": "Tool name to describe (shows parameters)"
+            },
+            "search": {
+              "type": "string",
+              "description": "Search tools by name/description"
+            },
+            "regex": {
+              "type": "boolean",
+              "description": "Treat search as regex (default: substring match)"
+            },
+            "includeSchemas": {
+              "type": "boolean",
+              "description": "Include parameter schemas in search results (default: true)"
+            },
+            "server": {
+              "type": "string",
+              "description": "Filter to specific server (also disambiguates tool calls)"
+            },
+            "action": {
+              "type": "string",
+              "description": "Action: 'ui-messages', 'auth-start', or 'auth-complete'"
+            }
+          }
+        },
+        "strict": false
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "ask_user_question",
+        "description": "Ask the user one or more structured questions during execution. Use when you need to:\n1. Gather user preferences or requirements\n2. Clarify ambiguous instructions\n3. Get decisions on implementation choices as you work\n4. Offer choices to the user about what direction to take\n\nUsage notes:\n- Users will always be able to type a custom answer (\"Type something.\" row is appended automatically to every single-select question) or pick \"Chat about this\" to abandon the questionnaire and continue in free-form conversation. Do NOT author \"Other\" / \"Type something.\" / \"Chat about this\" labels yourself — duplicates are rejected at runtime.\n- Use multiSelect: true to allow multiple answers to be selected for a question. The \"Type something.\" row is suppressed on multi-select questions, and is ALSO suppressed on single-select questions where any option carries a `preview` (the side-by-side layout has no room for inline custom text — \"Chat about this\" remains as the free-form escape hatch).\n- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label.\n\nPreview feature:\nUse the optional `preview` field on options when presenting concrete artifacts that users need to visually compare:\n- ASCII mockups of UI layouts or components\n- Code snippets showing different implementations\n- Diagram variations\n- Configuration examples\n\nPreview content is rendered as markdown in a monospace box. Multi-line text with newlines is supported. When any option has a preview, the UI switches to a side-by-side layout with a vertical option list on the left and preview on the right. Do not use previews for simple preference questions where labels and descriptions suffice. Note: previews are only supported for single-select questions (not multiSelect).",
+        "parameters": {
+          "type": "object",
+          "required": [
+            "questions"
+          ],
+          "properties": {
+            "questions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "question",
+                  "header",
+                  "options"
+                ],
+                "properties": {
+                  "question": {
+                    "type": "string",
+                    "description": "The complete question to ask the user. Should be clear, specific, and end with a question mark. Example: \"Which library should we use for date formatting?\" If multiSelect is true, phrase it accordingly, e.g. \"Which features do you want to enable?\""
+                  },
+                  "header": {
+                    "type": "string",
+                    "maxLength": 16,
+                    "description": "MAX 16 CHARACTERS — hard limit, requests over the limit are rejected. Very short chip/tag shown next to the question. Examples: \"Auth method\", \"Library\", \"Approach\"."
+                  },
+                  "options": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "label",
+                        "description"
+                      ],
+                      "properties": {
+                        "label": {
+                          "type": "string",
+                          "maxLength": 60,
+                          "description": "MAX 60 CHARACTERS — hard limit, requests over the limit are rejected. The display text for this option that the user will see and select. Should be concise (1-5 words) and clearly describe the choice."
+                        },
+                        "description": {
+                          "type": "string",
+                          "description": "Explanation of what this option means or what will happen if chosen. Useful for providing context about trade-offs or implications."
+                        },
+                        "preview": {
+                          "type": "string",
+                          "description": "Optional preview content rendered when this option is focused. Use for mockups, code snippets, or visual comparisons that help users compare options. See the tool description for the expected content format."
+                        }
+                      }
+                    },
+                    "minItems": 2,
+                    "maxItems": 4,
+                    "description": "The available choices for this question. Must have 2-4 options. Each option should be a distinct, mutually exclusive choice (unless multiSelect is enabled). The 'Type something.' row is appended automatically — do NOT author it."
+                  },
+                  "multiSelect": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Set to true to allow the user to select multiple options instead of just one. Use when choices are not mutually exclusive."
+                  }
+                }
+              },
+              "minItems": 1,
+              "maxItems": 4,
+              "description": "Questions to ask the user (1-4 questions)"
+            }
+          }
+        },
+        "strict": false
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "subagent_supervisor",
+        "description": "Native pi-subagents supervisor channel. Use reply/pending/status to answer child subagent requests without overriding pi-intercom.",
+        "parameters": {
+          "type": "object",
+          "required": [
+            "action"
+          ],
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "list",
+                "send",
+                "ask",
+                "reply",
+                "pending",
+                "status"
+              ]
+            },
+            "to": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "replyTo": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "strict": false
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "intercom",
+        "description": "Native pi-subagents supervisor channel. Use reply/pending/status to answer child subagent requests.",
+        "parameters": {
+          "type": "object",
+          "required": [
+            "action"
+          ],
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "list",
+                "send",
+                "ask",
+                "reply",
+                "pending",
+                "status"
+              ]
+            },
+            "to": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "replyTo": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "strict": false
+      }
+    }
+  ],
+  "reasoning": {
+    "effort": "high"
+  }
+}

@@ -1,0 +1,1152 @@
+/**
+ * Interactive `/workflows` navigator, modeled on Claude Code's view:
+ *
+ *   runs ──enter──▶ phases ──enter──▶ agents ──enter──▶ agent detail
+ *        ◀──esc───        ◀──esc────         ◀──esc────
+ *        ◀── (saved items in runs view) ──enter──▶ saved detail
+ *
+ * Keys: ↑/↓ (or j/k) select · enter/→ drill in · esc/← back (esc at top closes)
+ *       On runs: p pause · x stop · r restart · s save · q quit
+ *       On saved: x delete · q quit
+ *
+ * The state machine and line rendering are pure and unit-tested; the pi-tui
+ * Component shell (openWorkflowNavigator) wires them to live manager events.
+ */
+
+import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
+import { parseKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import type { WorkflowAgentSnapshot, WorkflowSnapshot } from "./display.js";
+import type { PersistedRunState } from "./run-persistence.js";
+import { registerSavedWorkflow } from "./saved-commands.js";
+import type { WorkflowManager } from "./workflow-manager.js";
+import type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
+
+const STATUS_ICON: Record<string, string> = {
+  pending: "·",
+  queued: "·",
+  running: "◆",
+  paused: "⏸",
+  completed: "✓",
+  done: "✓",
+  failed: "✗",
+  error: "✗",
+  aborted: "⊘",
+  skipped: "⊘",
+};
+
+/** Minimal theme surface so rendering is testable without the real Theme class. */
+export interface ThemeLike {
+  fg(color: string, text: string): string;
+  bold(text: string): string;
+}
+
+const PLAIN: ThemeLike = { fg: (_c, t) => t, bold: (t) => t };
+
+// Border characters for the overlay box
+const BOX_BORDER_LEFT = "│ ";
+const BOX_BORDER_RIGHT = " │";
+const BOX_BORDER_OVERHEAD = BOX_BORDER_LEFT.length + BOX_BORDER_RIGHT.length;
+
+export type ViewKind = "runs" | "phases" | "agents" | "detail" | "savedDetail";
+
+export type ItemKind = "run" | "saved";
+
+interface RunRow {
+  runId: string;
+  name: string;
+  status: string;
+  done: number;
+  total: number;
+  tokens: number;
+  cost: number;
+}
+interface PhaseRow {
+  title: string;
+  done: number;
+  total: number;
+  tokens: number;
+}
+interface AgentRow {
+  id: number;
+  label: string;
+  status: string;
+  phase?: string;
+  tokens?: number;
+  model?: string;
+}
+
+/** Short, human-friendly model label: drop the provider prefix for display. */
+export function shortModel(model: string | undefined): string | undefined {
+  if (!model) return undefined;
+  const slash = model.indexOf("/");
+  return slash > 0 ? model.slice(slash + 1) : model;
+}
+
+/** Reads run/phase/agent data from the manager, preferring live snapshots. */
+export class NavigatorModel {
+  constructor(
+    private readonly manager: Pick<WorkflowManager, "listRuns" | "getRun">,
+    private readonly storage?: { list(): SavedWorkflow[]; delete(name: string, location?: string): boolean },
+  ) {}
+
+  private snapshot(runId: string): { snapshot: WorkflowSnapshot; status: string } | undefined {
+    const live = this.manager.getRun(runId);
+    if (live) return { snapshot: live.snapshot, status: live.status };
+    const p = this.manager.listRuns().find((r) => r.runId === runId);
+    if (!p) return undefined;
+    return { snapshot: persistedToSnapshot(p), status: p.status };
+  }
+
+  runs(): RunRow[] {
+    return this.manager.listRuns().map((p) => {
+      const live = this.manager.getRun(p.runId);
+      const agents = (live?.snapshot.agents ?? p.agents) as WorkflowAgentSnapshot[];
+      return {
+        runId: p.runId,
+        name: live?.snapshot.name ?? p.workflowName,
+        status: live?.status ?? p.status,
+        done: agents.filter((a) => a.status === "done").length,
+        total: agents.length,
+        tokens: (live?.snapshot.tokenUsage ?? p.tokenUsage)?.total ?? 0,
+        cost: (live?.snapshot.tokenUsage ?? p.tokenUsage)?.cost ?? 0,
+      };
+    });
+  }
+
+  /** Return saved workflows sorted by name, or [] when no storage configured. */
+  saved(): SavedWorkflow[] {
+    if (!this.storage) return [];
+    return this.storage.list().sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /** Delete a saved workflow by name. */
+  deleteSaved(name: string): boolean {
+    if (!this.storage) return false;
+    return this.storage.delete(name);
+  }
+
+  runName(runId: string): string {
+    return this.snapshot(runId)?.snapshot.name ?? runId;
+  }
+
+  runStatus(runId: string): string {
+    return this.snapshot(runId)?.status ?? "unknown";
+  }
+
+  phases(runId: string): PhaseRow[] {
+    const snap = this.snapshot(runId)?.snapshot;
+    if (!snap) return [];
+    const order = snap.phases.length ? [...snap.phases] : [];
+    const byPhase = new Map<string, AgentRow[]>();
+    for (const a of snap.agents) {
+      const key = a.phase ?? "(no phase)";
+      if (!byPhase.has(key)) byPhase.set(key, []);
+      byPhase.get(key)?.push(a);
+      if (!order.includes(key)) order.push(key);
+    }
+    return order.map((title) => {
+      const agents = byPhase.get(title) ?? [];
+      return {
+        title,
+        done: agents.filter((a) => a.status === "done").length,
+        total: agents.length,
+        tokens: agents.reduce((n, a) => n + (a.tokens ?? 0), 0),
+      };
+    });
+  }
+
+  agents(runId: string, phase: string): AgentRow[] {
+    const snap = this.snapshot(runId)?.snapshot;
+    if (!snap) return [];
+    return snap.agents
+      .filter((a) => (a.phase ?? "(no phase)") === phase)
+      .map((a) => ({ id: a.id, label: a.label, status: a.status, phase: a.phase, tokens: a.tokens, model: a.model }));
+  }
+
+  agentDetail(runId: string, agentId: number): WorkflowAgentSnapshot | undefined {
+    return this.snapshot(runId)?.snapshot.agents.find((a) => a.id === agentId);
+  }
+}
+
+type StackFrame = {
+  kind: ViewKind;
+  cursor: number;
+  runId?: string;
+  phase?: string;
+  agentId?: number;
+  savedName?: string;
+};
+
+function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
+  return {
+    name: p.workflowName,
+    phases: p.phases,
+    currentPhase: p.currentPhase,
+    logs: p.logs,
+    agents: p.agents.map((a) => ({
+      id: a.id,
+      label: a.label,
+      phase: a.phase,
+      prompt: a.prompt,
+      status: a.status,
+      resultPreview:
+        a.result == null ? undefined : String(typeof a.result === "string" ? a.result : JSON.stringify(a.result)),
+      error: a.error,
+      errorCode: a.errorCode,
+      recoverable: a.recoverable,
+      history: a.history,
+      model: a.model,
+    })),
+    agentCount: p.agents.length,
+    runningCount: p.agents.filter((a) => a.status === "running").length,
+    doneCount: p.agents.filter((a) => a.status === "done").length,
+    errorCount: p.agents.filter((a) => a.status === "error").length,
+    tokenUsage: p.tokenUsage ? { ...p.tokenUsage } : undefined,
+    runId: p.runId,
+  };
+}
+
+/** Navigation state machine: a stack of (view, cursor) frames plus detail scroll. */
+export class NavigatorState {
+  private stack: StackFrame[] = [{ kind: "runs", cursor: 0 }];
+  scroll = 0;
+
+  private top(): StackFrame {
+    return this.stack[this.stack.length - 1];
+  }
+  get kind(): ViewKind {
+    return this.top().kind;
+  }
+  get cursor(): number {
+    return this.top().cursor;
+  }
+  set cursor(val: number) {
+    this.top().cursor = val;
+  }
+  get runId(): string | undefined {
+    return this.top().runId;
+  }
+  get phase(): string | undefined {
+    return this.top().phase;
+  }
+  get agentId(): number | undefined {
+    return this.top().agentId;
+  }
+  /** The saved workflow name at the cursor in savedDetail view */
+  get savedName(): string | undefined {
+    return this.top().savedName;
+  }
+  get depth(): number {
+    return this.stack.length;
+  }
+
+  /**
+   * Determine what kind of item is at the given cursor position in the
+   * runs view. Positions before runs.length are "run"; after are "saved".
+   */
+  itemKindAt(model: NavigatorModel, cursor: number): ItemKind {
+    const runCount = model.runs().length;
+    return cursor < runCount ? "run" : "saved";
+  }
+
+  /** Clamp the cursor to [0, count). */
+  clamp(count: number) {
+    const t = this.top();
+    t.cursor = count <= 0 ? 0 : Math.max(0, Math.min(t.cursor, count - 1));
+  }
+
+  move(delta: number, count: number) {
+    if (this.kind === "detail" || this.kind === "savedDetail") {
+      this.scroll = Math.max(0, this.scroll + delta);
+      return;
+    }
+    if (count <= 0) return;
+    const t = this.top();
+    t.cursor = (t.cursor + delta + count) % count;
+  }
+
+  /** Drill into the selected item. Returns true if the view changed. */
+  drill(model: NavigatorModel): boolean {
+    const t = this.top();
+    if (t.kind === "runs") {
+      const runs = model.runs();
+      const saved = model.saved();
+      if (t.cursor < runs.length) {
+        // Drilling into a run
+        const run = runs[t.cursor];
+        if (!run) return false;
+        this.stack.push({ kind: "phases", cursor: 0, runId: run.runId });
+        return true;
+      }
+      // Drilling into a saved workflow
+      const item = saved[t.cursor - runs.length];
+      if (!item) return false;
+      this.scroll = 0;
+      this.stack.push({ kind: "savedDetail", cursor: 0, savedName: item.name });
+      return true;
+    }
+    if (t.kind === "phases" && t.runId) {
+      const phases = model.phases(t.runId);
+      const ph = phases[t.cursor];
+      if (!ph) return false;
+      this.stack.push({ kind: "agents", cursor: 0, runId: t.runId, phase: ph.title });
+      return true;
+    }
+    if (t.kind === "agents" && t.runId && t.phase) {
+      const agents = model.agents(t.runId, t.phase);
+      const ag = agents[t.cursor];
+      if (!ag) return false;
+      this.scroll = 0;
+      this.stack.push({ kind: "detail", cursor: 0, runId: t.runId, phase: t.phase, agentId: ag.id });
+      return true;
+    }
+    return false;
+  }
+
+  /** Pop one level. Returns false when already at the top (caller should close). */
+  back(): boolean {
+    if (this.stack.length <= 1) return false;
+    this.stack.pop();
+    this.scroll = 0;
+    return true;
+  }
+
+  /** The runId at cursor, or undefined when on a saved item. */
+  activeRunId(model: NavigatorModel): string | undefined {
+    if (this.runId) return this.runId;
+    if (this.kind === "runs") {
+      const runs = model.runs();
+      if (this.cursor < runs.length) return runs[this.cursor]?.runId;
+    }
+    return undefined;
+  }
+}
+
+function pad(n: number): string {
+  return n.toLocaleString();
+}
+
+function fmtTokens(t: number): string {
+  return t > 0 ? `${pad(t)} tok` : "";
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Two-pane (Phases | agents) renderer — Claude-Code parity.
+//
+// Draws a single combined frame that shares one top rule and one full-height
+// vertical divider between a left "Phases" box and a right "<phase> · N agent"
+// box. Pure: depends only on state + model + theme + width. All measuring is
+// ANSI-aware (visibleWidth) and all padding/truncation goes through
+// truncateToWidth so colored cells still align.
+// ───────────────────────────────────────────────────────────────────────────
+
+// Light box-drawing glyphs (no heavy/double variants).
+const BX = { h: "─", v: "│", tl: "┌", tr: "┐", bl: "└", br: "┘", tj: "┬", bj: "┴" } as const;
+const CARET = "›";
+const DOT = "●";
+const ELLIPSIS = "…";
+
+// Tunables (exposed for clarity / future tuning) — see spec §0/§10.
+const LW_MIN = 14;
+const RW_MIN = 24;
+const GAP_NM = 2; // min spaces between agent name and model columns
+
+/** Compact token count: 842, 35k, 35.7k, 1.3M (trailing .0 trimmed). */
+function compactTokens(t: number): string {
+  if (!t || t <= 0) return "0";
+  if (t < 1000) return String(Math.round(t));
+  if (t < 1_000_000) {
+    const k = t / 1000;
+    const s = k >= 100 ? Math.round(k).toString() : trimZero(k.toFixed(1));
+    return `${s}k`;
+  }
+  const m = t / 1_000_000;
+  return `${trimZero(m.toFixed(1))}M`;
+}
+function trimZero(s: string): string {
+  return s.endsWith(".0") ? s.slice(0, -2) : s;
+}
+
+function pluralize(word: string, n: number): string {
+  return n === 1 ? word : `${word}s`;
+}
+
+/** Aggregate phase status precedence: ERR > RUN > all-done(OK) > PEND. */
+function phaseStatusColor(p: { done: number; total: number }, agents: AgentRow[]): string {
+  if (agents.some((a) => a.status === "error" || a.status === "failed")) return "error";
+  if (agents.some((a) => a.status === "running")) return "warning";
+  if (p.total > 0 && p.done === p.total) return "success";
+  return "dim";
+}
+
+const AGENT_DOT_COLOR: Record<string, string> = {
+  running: "warning",
+  queued: "dim",
+  pending: "dim",
+  paused: "dim",
+  done: "success",
+  completed: "success",
+  error: "error",
+  failed: "error",
+  skipped: "dim",
+  aborted: "dim",
+};
+
+/** Compute the left ("Phases") box outer width, clamped per spec §3.1. */
+function computeLeftWidth(phases: PhaseRow[], width: number): number {
+  const titleNeed = visibleWidth("Phases") + 2 /*spaces*/ + 1 /*┌*/ + 1 /*┬*/ + 3 /*min dashes*/;
+  let contentMax = 0;
+  phases.forEach((p, i) => {
+    const idx = String(i + 1);
+    const hasAgents = p.total > 0;
+    const need =
+      2 /*marker*/ +
+      visibleWidth(idx) +
+      1 /*sp*/ +
+      visibleWidth(p.title) +
+      (hasAgents ? 1 + visibleWidth(`${p.done}/${p.total}`) : 0);
+    if (need > contentMax) contentMax = need;
+  });
+  const innerNeed = Math.max(contentMax, titleNeed - 2);
+  const lwNatural = innerNeed + 2; // + left │ + shared │
+  const lwMax = Math.min(40, Math.floor(width * 0.45));
+  return Math.max(LW_MIN, Math.min(lwNatural, Math.max(LW_MIN, lwMax)));
+}
+
+/** Build a left-pane phase row (content field, exact width = innerW). */
+function leftPhaseRow(
+  p: PhaseRow,
+  i: number,
+  selected: boolean,
+  agents: AgentRow[],
+  innerW: number,
+  theme: ThemeLike,
+): string {
+  const idx = String(i + 1);
+  const hasAgents = p.total > 0;
+  const progress = hasAgents ? `${p.done}/${p.total}` : "";
+  const marker = selected ? `${CARET} ` : "  ";
+  // Fixed parts width: marker + idx + space + (space+progress if shown)
+  const fixed = 2 + visibleWidth(idx) + 1 + (progress ? 1 + visibleWidth(progress) : 0);
+  const nameRoom = Math.max(0, innerW - fixed);
+  const name = truncateToWidth(p.title, nameRoom, ELLIPSIS, false);
+
+  const styleMain = (s: string) => (selected ? theme.fg("accent", theme.bold(s)) : hasAgents ? s : theme.fg("dim", s));
+  const progStyle = (s: string) =>
+    selected ? theme.fg("accent", theme.bold(s)) : theme.fg(phaseStatusColor(p, agents), s);
+
+  const caret = selected ? theme.fg("accent", theme.bold(marker)) : marker;
+  let row = caret + styleMain(`${idx} ${name}`);
+  if (progress) row += ` ${progStyle(progress)}`;
+  return truncateToWidth(row, innerW, "", true); // pad to exact innerW
+}
+
+/** Build a right-pane agent row (content field, exact width = innerW). */
+function rightAgentRow(
+  a: AgentRow,
+  selected: boolean,
+  modelColStart: number,
+  innerW: number,
+  theme: ThemeLike,
+): string {
+  const dotColor = AGENT_DOT_COLOR[a.status] ?? "dim";
+  const stats = `${compactTokens(a.tokens ?? 0)} tok`;
+  const model = shortModel(a.model) ?? "";
+
+  // Stable 2-cell marker so columns never shift on selection: "› " | "  ".
+  // Layout: <marker:2><dot><sp><name> … <model> … <stats(right-aligned)>.
+  const markerW = 2;
+  const statsW = visibleWidth(stats);
+  const nameStart = markerW + 2; // marker + dot + space
+  let modelStart = Math.max(nameStart + visibleWidth(a.label) + GAP_NM, markerW + modelColStart);
+  const statsStart = innerW - statsW;
+
+  // Available room for the model block (between modelStart and stats, min 1 gap).
+  let modelRoom = statsStart - 1 - modelStart;
+  let nameOut = a.label;
+  let modelOut = model;
+  if (modelRoom < 0) {
+    // No room for model: drop it (spec §4.4 step 1/2), possibly truncate name.
+    modelOut = "";
+    modelStart = nameStart;
+    modelRoom = 0;
+    const nameRoom = Math.max(0, statsStart - 1 - nameStart);
+    nameOut = truncateToWidth(a.label, nameRoom, ELLIPSIS, false);
+  } else {
+    modelOut = truncateToWidth(model, modelRoom, ELLIPSIS, false);
+    const nameRoom = Math.max(0, modelStart - GAP_NM - nameStart);
+    nameOut = truncateToWidth(a.label, nameRoom, ELLIPSIS, false);
+  }
+
+  const marker = selected ? theme.fg("accent", theme.bold(`${CARET} `)) : "  ";
+  const dot = theme.fg(dotColor, DOT);
+  const nameStyled = selected ? theme.fg("accent", theme.bold(nameOut)) : theme.fg("accent", nameOut);
+  const modelStyled = modelOut ? theme.fg("dim", modelOut) : "";
+  const statsStyled = theme.fg("dim", stats);
+
+  // Assemble with explicit cell padding (visibleWidth-driven gaps).
+  let out = marker + dot + " " + nameStyled;
+  const afterName = nameStart + visibleWidth(nameOut);
+  if (modelOut) {
+    out += " ".repeat(Math.max(0, modelStart - afterName)) + modelStyled;
+    const afterModel = modelStart + visibleWidth(modelOut);
+    out += " ".repeat(Math.max(0, statsStart - afterModel)) + statsStyled;
+  } else {
+    out += " ".repeat(Math.max(0, statsStart - afterName)) + statsStyled;
+  }
+  return truncateToWidth(out, innerW, "", true);
+}
+
+/** Compose a titled top rule for one box side (between two join chars). */
+function topTitleSegment(title: string, innerW: number, leading: boolean, theme: ThemeLike): string {
+  // leading=true → right box (one ─ before the title); leading=false → left box.
+  const label = ` ${title} `;
+  const lead = leading ? BX.h : "";
+  let labelOut = label;
+  const fixed = visibleWidth(lead) + 1; // + at least one trailing dash
+  if (visibleWidth(label) > innerW - fixed) {
+    labelOut = truncateToWidth(label, Math.max(0, innerW - fixed), ELLIPSIS, false);
+  }
+  const used = visibleWidth(lead) + visibleWidth(labelOut);
+  const dashes = BX.h.repeat(Math.max(0, innerW - used));
+  return theme.fg("muted", lead) + theme.fg("dim", labelOut) + theme.fg("muted", dashes);
+}
+
+interface TwoPaneArgs {
+  width: number;
+  bodyRows: number;
+  left: string[]; // pre-rendered left content rows (exact LW-2 cells each)
+  right: string[]; // pre-rendered right content rows (exact RW-2 cells each)
+  leftTitle: string;
+  rightTitle: string;
+  leftW: number; // LW
+  theme: ThemeLike;
+}
+
+/** Emit the full combined frame (top rule, body rows, bottom rule). */
+function renderTwoPaneFrame(a: TwoPaneArgs): string[] {
+  const { width, bodyRows, left, right, leftTitle, rightTitle, leftW, theme } = a;
+  // RW fills the remainder; the divider column is shared (overlaps 1 cell) so
+  // net rendered width = LW + RW - 1 = width. Hence RW = width - LW + 1.
+  const rightW = width - leftW + 1;
+  const leftInner = leftW - 2;
+  const rightInner = rightW - 2;
+  const bc = (s: string) => theme.fg("muted", s);
+  const out: string[] = [];
+
+  // Top rule: ┌ <left title> ┬ <right title> ┐
+  out.push(
+    bc(BX.tl) +
+      topTitleSegment(leftTitle, leftInner, false, theme) +
+      bc(BX.tj) +
+      topTitleSegment(rightTitle, rightInner, true, theme) +
+      bc(BX.tr),
+  );
+
+  // Body rows.
+  const blankL = " ".repeat(leftInner);
+  const blankR = " ".repeat(rightInner);
+  for (let r = 0; r < bodyRows; r++) {
+    const l = left[r] ?? blankL;
+    const rr = right[r] ?? blankR;
+    out.push(bc(BX.v) + l + bc(BX.v) + rr + bc(BX.v));
+  }
+
+  // Bottom rule: └ ─ ┴ ─ ┘
+  out.push(bc(BX.bl) + bc(BX.h.repeat(leftInner)) + bc(BX.bj) + bc(BX.h.repeat(rightInner)) + bc(BX.br));
+  return out;
+}
+
+/**
+ * Render the combined Phases | agents two-pane view. Shared by the "phases"
+ * branch (cursor in left/Phases pane) and the "agents" branch (cursor in
+ * right/agents pane after drilling in). Returns the full frame as lines.
+ */
+function renderPhasesAgents(
+  state: NavigatorState,
+  model: NavigatorModel,
+  runId: string,
+  width: number,
+  theme: ThemeLike,
+  bodyCap: number,
+): string[] {
+  const phases = model.phases(runId);
+  // Which phase is selected drives the right pane. In "phases" view it's the
+  // cursor; in "agents" view it's the drilled-in phase (state.phase).
+  const inAgents = state.kind === "agents";
+  let selPhaseIdx = inAgents ? phases.findIndex((p) => p.title === state.phase) : state.cursor;
+  if (selPhaseIdx < 0) selPhaseIdx = 0;
+  const selPhase = phases[selPhaseIdx];
+  const agents = selPhase ? model.agents(runId, selPhase.title) : [];
+
+  // Narrow-terminal degrade: single pane (spec §7.1).
+  if (width < LW_MIN + RW_MIN - 1) {
+    return renderSinglePane(state, phases, selPhaseIdx, agents, width, theme, bodyCap, inAgents);
+  }
+
+  const leftW = computeLeftWidth(phases, width);
+  const rightW = width - leftW + 1; // shared divider overlaps 1 cell
+  const leftInner = leftW - 2;
+  const rightInner = rightW - 2;
+
+  // Vertical scroll so the active item stays visible (spec §7.2).
+  const leftRows = scrollWindow(phases.length, inAgents ? selPhaseIdx : state.cursor, bodyCap);
+  const rightRows = scrollWindow(agents.length, inAgents ? state.cursor : 0, bodyCap);
+  const bodyRows = Math.max(1, Math.min(bodyCap, Math.max(leftRows.count, rightRows.count)));
+
+  // Left column (Phases).
+  const left: string[] = [];
+  for (let k = 0; k < bodyRows; k++) {
+    const idx = leftRows.start + k;
+    if (idx >= phases.length) {
+      left.push(" ".repeat(leftInner));
+      continue;
+    }
+    const p = phases[idx];
+    const selected = !inAgents && idx === state.cursor;
+    const ag = model.agents(runId, p.title);
+    let row = leftPhaseRow(p, idx, selected, ag, leftInner, theme);
+    if (k === bodyRows - 1 && leftRows.more) {
+      row = truncateToWidth(theme.fg("dim", `  ${ELLIPSIS}`), leftInner, "", true);
+    }
+    left.push(row);
+  }
+
+  // Right column (agents of selected phase).
+  const modelColStart = computeModelColStart(agents, rightInner);
+  const right: string[] = [];
+  if (agents.length === 0) {
+    const msg = truncateToWidth(theme.fg("dim", "no agents"), rightInner, "", true);
+    for (let k = 0; k < bodyRows; k++) right.push(k === 0 ? msg : " ".repeat(rightInner));
+  } else {
+    for (let k = 0; k < bodyRows; k++) {
+      const idx = rightRows.start + k;
+      if (idx >= agents.length) {
+        right.push(" ".repeat(rightInner));
+        continue;
+      }
+      const selected = inAgents && idx === state.cursor;
+      let row = rightAgentRow(agents[idx], selected, modelColStart, rightInner, theme);
+      if (k === bodyRows - 1 && rightRows.more) {
+        row = truncateToWidth(theme.fg("dim", `  ${ELLIPSIS}`), rightInner, "", true);
+      }
+      right.push(row);
+    }
+  }
+
+  const n = agents.length;
+  const rightTitle = `${selPhase ? selPhase.title : "(none)"} · ${n} ${pluralize("agent", n)}`;
+  return renderTwoPaneFrame({
+    width,
+    bodyRows,
+    left,
+    right,
+    leftTitle: "Phases",
+    rightTitle,
+    leftW,
+    theme,
+  });
+}
+
+/** Model column start aligned across agent rows (spec §4.3), clamped to field. */
+function computeModelColStart(agents: AgentRow[], innerW: number): number {
+  let maxName = 0;
+  for (const a of agents) maxName = Math.max(maxName, visibleWidth(a.label));
+  const start = 2 /*dot+sp*/ + maxName + GAP_NM;
+  // Keep model column from colliding with the right edge; cap at ~55% of field.
+  return Math.min(start, Math.max(2, Math.floor(innerW * 0.55)));
+}
+
+interface ScrollWin {
+  start: number;
+  count: number;
+  more: boolean;
+}
+/** Compute a scroll window of up to `cap` rows keeping `active` visible. */
+function scrollWindow(total: number, active: number, cap: number): ScrollWin {
+  if (total <= cap) return { start: 0, count: total, more: false };
+  let start = Math.max(0, Math.min(active - Math.floor(cap / 2), total - cap));
+  if (active < start) start = active;
+  if (active >= start + cap) start = active - cap + 1;
+  return { start, count: cap, more: start + cap < total };
+}
+
+/** Narrow-terminal single pane (spec §7.1): show the active pane full width. */
+function renderSinglePane(
+  state: NavigatorState,
+  phases: PhaseRow[],
+  selPhaseIdx: number,
+  agents: AgentRow[],
+  width: number,
+  theme: ThemeLike,
+  bodyCap: number,
+  inAgents: boolean,
+): string[] {
+  const innerW = Math.max(1, width - 2);
+  const bc = (s: string) => theme.fg("muted", s);
+  const out: string[] = [];
+  if (inAgents) {
+    const selPhase = phases[selPhaseIdx];
+    const n = agents.length;
+    const title = `${selPhase ? selPhase.title : "(none)"} · ${n} ${pluralize("agent", n)}`;
+    out.push(bc(BX.tl) + topTitleSegment(title, innerW, false, theme) + bc(BX.tr));
+    const win = scrollWindow(agents.length, state.cursor, bodyCap);
+    const modelColStart = computeModelColStart(agents, innerW);
+    const rows = Math.max(1, win.count);
+    for (let k = 0; k < rows; k++) {
+      const idx = win.start + k;
+      if (idx >= agents.length) {
+        out.push(bc(BX.v) + " ".repeat(innerW) + bc(BX.v));
+        continue;
+      }
+      let row = rightAgentRow(agents[idx], idx === state.cursor, modelColStart, innerW, theme);
+      if (k === rows - 1 && win.more) row = truncateToWidth(theme.fg("dim", `  ${ELLIPSIS}`), innerW, "", true);
+      out.push(bc(BX.v) + row + bc(BX.v));
+    }
+  } else {
+    out.push(bc(BX.tl) + topTitleSegment("Phases", innerW, false, theme) + bc(BX.tr));
+    const win = scrollWindow(phases.length, state.cursor, bodyCap);
+    const rows = Math.max(1, win.count);
+    for (let k = 0; k < rows; k++) {
+      const idx = win.start + k;
+      if (idx >= phases.length) {
+        out.push(bc(BX.v) + " ".repeat(innerW) + bc(BX.v));
+        continue;
+      }
+      const p = phases[idx];
+      let row = leftPhaseRow(p, idx, idx === state.cursor, [], innerW, theme);
+      if (k === rows - 1 && win.more) row = truncateToWidth(theme.fg("dim", `  ${ELLIPSIS}`), innerW, "", true);
+      out.push(bc(BX.v) + row + bc(BX.v));
+    }
+  }
+  out.push(bc(BX.bl) + bc(BX.h.repeat(innerW)) + bc(BX.br));
+  return out;
+}
+
+/** Build the lines for the current view. Pure: depends only on state + model + theme. */
+export function renderNavigator(
+  state: NavigatorState,
+  model: NavigatorModel,
+  width: number,
+  theme: ThemeLike = PLAIN,
+  viewportRows = 24,
+): string[] {
+  const lines: string[] = [];
+  const sel = (i: number, text: string) =>
+    i === state.cursor ? theme.fg("accent", theme.bold(`❯ ${text}`)) : `  ${text}`;
+  const dim = (t: string) => theme.fg("dim", t);
+
+  // Render a detail body inside a FIXED-height viewport so j/k scrolls within a
+  // stable box (clamping state.scroll) instead of slicing to the end — which
+  // shrank the overlay and looked like it was collapsing.
+  const pushScrollable = (body: string[]) => {
+    const viewport = Math.max(5, viewportRows - 4); // reserve title + blank + footer + indicator
+    const maxScroll = Math.max(0, body.length - viewport);
+    state.scroll = Math.min(Math.max(0, state.scroll), maxScroll);
+    lines.push(...body.slice(state.scroll, state.scroll + viewport));
+    if (body.length > viewport) {
+      const end = Math.min(state.scroll + viewport, body.length);
+      lines.push(dim(`  [${state.scroll + 1}-${end} / ${body.length}]`));
+    }
+  };
+
+  if (state.kind === "runs") {
+    const runs = model.runs();
+    const saved = model.saved();
+    const total = runs.length + saved.length;
+    state.clamp(total);
+    lines.push(theme.bold("Workflows"));
+    if (total === 0) {
+      lines.push(dim("  No runs yet. Start one with a background workflow."));
+    }
+    // Render runs
+    runs.forEach((r, i) => {
+      const icon = STATUS_ICON[r.status] ?? "?";
+      const meta = [`${r.done}/${r.total}`, fmtTokens(r.tokens), r.cost > 0 ? `$${r.cost.toFixed(4)}` : ""]
+        .filter(Boolean)
+        .join(" · ");
+      lines.push(sel(i, `${icon} ${r.name}  ${dim(`${r.runId} · ${r.status} · ${meta}`)}`));
+    });
+    // Render saved workflows after a separator
+    if (saved.length > 0) {
+      const sepOffset = runs.length;
+      if (runs.length > 0) lines.push(dim("  ── saved ──"));
+      saved.forEach((w, i) => {
+        const loc = w.location === "user" ? "~" : ".";
+        const desc = w.description ? dim(`  ${w.description}`) : "";
+        lines.push(sel(sepOffset + i, `${w.name}${desc}  ${dim(loc)}`));
+      });
+    }
+  } else if (state.kind === "phases" && state.runId) {
+    const phases = model.phases(state.runId);
+    state.clamp(phases.length);
+    // Two-line header (name + description/status) then the combined frame.
+    lines.push(...twoPaneHeader(model, state.runId, phases, width, theme));
+    // Body cap: total height minus 2 header + 2 frame rules + blank + footer.
+    const bodyCap = Math.max(1, viewportRows - 2 /*header*/ - 2 /*rules*/ - 2 /*blank+footer*/);
+    lines.push(...renderPhasesAgents(state, model, state.runId, width, theme, bodyCap));
+  } else if (state.kind === "agents" && state.runId && state.phase) {
+    const agents = model.agents(state.runId, state.phase);
+    state.clamp(agents.length);
+    const phases = model.phases(state.runId);
+    lines.push(...twoPaneHeader(model, state.runId, phases, width, theme));
+    const bodyCap = Math.max(1, viewportRows - 2 - 2 - 2);
+    lines.push(...renderPhasesAgents(state, model, state.runId, width, theme, bodyCap));
+  } else if (state.kind === "detail" && state.runId && state.agentId != null) {
+    const a = model.agentDetail(state.runId, state.agentId);
+    lines.push(theme.bold(a ? a.label : "agent"));
+    if (a) {
+      const body: string[] = [];
+      body.push(dim("Status: ") + (a.status ?? ""));
+      if (a.model) body.push(dim("Model: ") + (shortModel(a.model) ?? ""));
+      if (a.error) body.push(dim("Error: ") + a.error);
+      if (a.errorCode) body.push(`${dim("Error code: ")}${a.errorCode}${a.recoverable ? " (recoverable)" : ""}`);
+      body.push("", dim("Prompt:"));
+      body.push(...wrap(a.prompt ?? "", width));
+      body.push("", dim("Result:"));
+      body.push(...wrap(a.resultPreview ?? "(none)", width));
+      if (a.history?.length) {
+        body.push("", dim("History:"));
+        for (const entry of a.history) {
+          body.push(...wrap(`${historyLabel(entry)}: ${entry.text}`, width));
+        }
+      }
+      pushScrollable(body);
+    }
+  } else if (state.kind === "savedDetail" && state.savedName) {
+    const saved = model.saved();
+    const w = saved.find((s) => s.name === state.savedName);
+    lines.push(theme.bold(w ? w.name : "saved workflow"));
+    if (w) {
+      const body: string[] = [];
+      if (w.description) body.push(dim("Description: ") + w.description);
+      body.push(dim("Location: ") + (w.location === "user" ? "user (~/.pi)" : "project (.pi)"));
+      body.push(dim("Saved at: ") + w.savedAt);
+      if (w.parameters) body.push(dim("Parameters: ") + JSON.stringify(w.parameters));
+      body.push("", dim("Script:"));
+      body.push(...wrap(w.script, width));
+      pushScrollable(body);
+    }
+  }
+
+  lines.push("");
+  lines.push(footerHint(state, model, theme));
+  return lines;
+}
+
+/**
+ * Two-line header above the Phases | agents frame (spec §1):
+ *   line 0: <name>                          (ACCENT_BOLD)
+ *   line 1: <status>            <done>/<total> agent[s] · <tokens>   (DIM)
+ * Right segment is built first and never truncated; the left segment is
+ * truncated to the remaining width with an ellipsis.
+ */
+function twoPaneHeader(
+  model: NavigatorModel,
+  runId: string,
+  phases: PhaseRow[],
+  width: number,
+  theme: ThemeLike,
+): string[] {
+  const name = model.runName(runId);
+  const status = model.runStatus(runId);
+  let done = 0;
+  let total = 0;
+  let tokens = 0;
+  for (const p of phases) {
+    done += p.done;
+    total += p.total;
+    tokens += p.tokens;
+  }
+  // Line 0 — name (accent + bold), truncated to width if needed.
+  const nameText = truncateToWidth(name, width, ELLIPSIS, false);
+  const line0 = theme.fg("accent", theme.bold(nameText));
+
+  // Line 1 — left status, right summary.
+  const rightRaw = `${done}/${total} ${pluralize("agent", total)}${tokens > 0 ? ` · ${compactTokens(tokens)} tok` : ""}`;
+  const rightW = visibleWidth(rightRaw);
+  const gap = 2;
+  let line1: string;
+  if (rightW >= width) {
+    // No room for left content: right-align (truncate from the right as last resort).
+    line1 = theme.fg("dim", truncateToWidth(rightRaw, width, ELLIPSIS, false));
+  } else {
+    const availL = width - rightW - gap;
+    const leftText = availL > 0 ? truncateToWidth(status, availL, ELLIPSIS, false) : "";
+    const leftW = visibleWidth(leftText);
+    const fill = " ".repeat(Math.max(gap, width - leftW - rightW));
+    line1 = theme.fg("dim", leftText) + fill + theme.fg("dim", rightRaw);
+  }
+  return [line0, line1];
+}
+
+function historyLabel(entry: NonNullable<WorkflowAgentSnapshot["history"]>[number]): string {
+  if (entry.kind === "toolCall") return entry.toolName ? `assistant tool ${entry.toolName}` : "assistant tool";
+  if (entry.role === "tool") return entry.toolName ? `tool ${entry.toolName}` : "tool";
+  if (entry.kind === "error") return `${entry.role} error`;
+  return entry.role;
+}
+
+function footerHint(state: NavigatorState, model: NavigatorModel, theme: ThemeLike): string {
+  const parts: string[] = [];
+  switch (state.kind) {
+    case "detail":
+      parts.push("j/k scroll", "esc back");
+      break;
+    case "savedDetail":
+      parts.push("j/k scroll", "esc back", "x delete");
+      break;
+    case "runs": {
+      const itemKind = model.saved().length > 0 ? state.itemKindAt(model, state.cursor) : "run";
+      parts.push("↑/↓ select", "enter open", "esc back");
+      if (itemKind === "run") {
+        parts.push("p pause", "x stop", "r restart", "s save");
+      } else {
+        parts.push("x delete");
+      }
+      parts.push("q quit");
+      break;
+    }
+    default:
+      parts.push("↑/↓ select", "enter open", "esc back", "q quit");
+  }
+  return theme.fg("dim", parts.join(" · "));
+}
+
+function wrap(text: string, width: number): string[] {
+  return wrapTextWithAnsi(text ?? "", Math.max(20, width));
+}
+
+/** What a key press should do. Pure mapping from a parsed key id to an action. */
+export type NavAction =
+  | { type: "move"; delta: number }
+  | { type: "drill" }
+  | { type: "back" }
+  | { type: "close" }
+  | { type: "pause" }
+  | { type: "stop" }
+  | { type: "restart" }
+  | { type: "save" }
+  | { type: "deleteSaved" }
+  | { type: "none" };
+
+export function keyToAction(keyId: string | undefined, kind: ViewKind, itemKind?: "run" | "saved"): NavAction {
+  switch (keyId) {
+    case "up":
+      return { type: "move", delta: -1 };
+    case "down":
+      return { type: "move", delta: 1 };
+    case "k":
+      return { type: "move", delta: -1 };
+    case "j":
+      return { type: "move", delta: 1 };
+    case "enter":
+    case "return":
+    case "right":
+      if (kind === "detail" || kind === "savedDetail") return { type: "none" };
+      return { type: "drill" };
+    case "escape":
+    case "esc":
+    case "left":
+      return { type: "back" };
+    case "q":
+      return { type: "close" };
+    case "p":
+      return { type: "pause" };
+    case "x":
+      if (kind === "savedDetail" || itemKind === "saved") return { type: "deleteSaved" };
+      return { type: "stop" };
+    case "r":
+      return { type: "restart" };
+    case "s":
+      if (itemKind === "saved") return { type: "none" };
+      return { type: "save" };
+    default:
+      return { type: "none" };
+  }
+}
+
+function currentCount(state: NavigatorState, model: NavigatorModel): number {
+  if (state.kind === "runs") return model.runs().length + model.saved().length;
+  if (state.kind === "phases" && state.runId) return model.phases(state.runId).length;
+  if (state.kind === "agents" && state.runId && state.phase) return model.agents(state.runId, state.phase).length;
+  return 0;
+}
+
+import type { OverlayAnchor } from "@earendil-works/pi-tui";
+
+export interface NavigatorOptions {
+  storage?: WorkflowStorage;
+  cwd?: string;
+  /** Overlay anchor position: "center" (default) or "right-center" for sidebar. */
+  anchor?: OverlayAnchor;
+}
+
+/**
+ * Open the interactive `/workflows` navigator as a focused overlay. Resolves when
+ * the user closes it (esc at the top level, or `q`).
+ */
+export function openWorkflowNavigator(
+  pi: ExtensionAPI,
+  manager: WorkflowManager,
+  ui: ExtensionUIContext,
+  opts: NavigatorOptions = {},
+): Promise<void> {
+  const model = new NavigatorModel(manager, opts.storage);
+  const state = new NavigatorState();
+
+  return ui.custom<void>(
+    (tui: TUI, theme: Theme, _keybindings, done: (r: undefined) => void) => {
+      const rerender = () => tui.requestRender();
+      const events = ["agentStart", "agentEnd", "phase", "log", "complete", "error", "stopped", "paused", "resumed"];
+      const onEvent = () => rerender();
+      for (const ev of events) manager.on(ev, onEvent);
+      const cleanup = () => {
+        for (const ev of events) manager.off(ev, onEvent);
+      };
+
+      const act = (data: string) => {
+        const itemKind = state.kind === "runs" ? state.itemKindAt(model, state.cursor) : undefined;
+        const action = keyToAction(parseKey(data), state.kind, itemKind);
+        switch (action.type) {
+          case "move":
+            state.move(action.delta, currentCount(state, model));
+            break;
+          case "drill":
+            state.drill(model);
+            break;
+          case "back":
+            if (!state.back()) {
+              cleanup();
+              done(undefined);
+            }
+            break;
+          case "close":
+            cleanup();
+            done(undefined);
+            return;
+          case "deleteSaved": {
+            if (state.kind === "runs") {
+              const saved = model.saved();
+              const runCount = model.runs().length;
+              const item = saved[state.cursor - runCount];
+              if (item) {
+                model.deleteSaved(item.name);
+                ui.notify(`Deleted /${item.name}`, "info");
+              }
+            } else if (state.kind === "savedDetail" && state.savedName) {
+              model.deleteSaved(state.savedName);
+              ui.notify(`Deleted /${state.savedName}`, "info");
+              state.back();
+            }
+            break;
+          }
+          case "pause": {
+            const id = state.activeRunId(model);
+            if (id) ui.notify(manager.pause(id) ? `Paused ${id}` : `Cannot pause ${id}`, "info");
+            break;
+          }
+          case "stop": {
+            const id = state.activeRunId(model);
+            if (id) ui.notify(manager.stop(id) ? `Stopped ${id}` : `Cannot stop ${id}`, "info");
+            break;
+          }
+          case "restart": {
+            const id = state.activeRunId(model);
+            const run = id ? manager.listRuns().find((r) => r.runId === id) : undefined;
+            if (!run?.script) {
+              ui.notify(id ? `Cannot restart ${id} (no script saved)` : "No run selected to restart", "warning");
+              break;
+            }
+            const { runId: newId } = manager.startInBackground(run.script, run.args);
+            ui.notify(`Restarted ${run.workflowName || "workflow"} as ${newId}`, "info");
+            break;
+          }
+          case "save": {
+            const id = state.activeRunId(model);
+            const run = id ? manager.listRuns().find((r) => r.runId === id) : undefined;
+            if (!run?.script) {
+              ui.notify("No saved run script to save", "warning");
+            } else if (!opts.storage) {
+              ui.notify("Saving is not available (no storage)", "error");
+            } else {
+              const storage = opts.storage;
+              const name = run.workflowName || "workflow";
+              let saved: ReturnType<WorkflowStorage["save"]>;
+              try {
+                saved = storage.save({
+                  name,
+                  description: run.workflowName,
+                  script: run.script,
+                  location: "project",
+                });
+              } catch (error) {
+                ui.notify(error instanceof Error ? error.message : String(error), "error");
+                break;
+              }
+              registerSavedWorkflow(pi, opts.cwd ?? process.cwd(), saved, undefined, () =>
+                storage.list().some((w) => w.name === saved.name),
+              );
+              ui.notify(`Saved /${name}`, "info");
+            }
+            break;
+          }
+          default:
+            return;
+        }
+        rerender();
+      };
+
+      // Wrap the rendered content inside a visual box border for better
+      // screen-boundary contrast. Follows the same pattern as pi-ask-user:
+      //   top border ──╭───╮
+      //   side borders │ … │
+      //   bottom border╰───╯
+      let _focused = false;
+      const component: Component & Focusable & { dispose?(): void } = {
+        get focused(): boolean {
+          return _focused;
+        },
+        set focused(v: boolean) {
+          _focused = v;
+        },
+        render: (width: number) => {
+          // Brighter border when focused, muted when not
+          const borderColor = (s: string) => (_focused ? theme.fg("accent", s) : theme.fg("borderMuted", s));
+          const titleColor = (s: string) => (_focused ? theme.fg("dim", theme.bold(s)) : theme.fg("muted", s));
+          const bgColor = (s: string) => theme.bg("customMessageBg", s);
+          const innerWidth = Math.max(10, width - BOX_BORDER_OVERHEAD);
+          const raw = renderNavigator(state, model, innerWidth, theme, tui.terminal?.rows ?? 24);
+          const title = titleColor(" workflows ");
+          const topBorder =
+            borderColor("╭─") + title + borderColor("─".repeat(Math.max(0, innerWidth - 10))) + borderColor("╮");
+          const botBorder = borderColor(`╰${"─".repeat(Math.max(0, innerWidth + 2))}╯`);
+          const wrapAndBg = (line: string) => {
+            const padded = truncateToWidth(line, innerWidth, "", true);
+            const fullLine = borderColor(BOX_BORDER_LEFT) + padded + borderColor(BOX_BORDER_RIGHT);
+            // Fill trailing whitespace for consistent background across the width
+            const trailingPad = width - fullLine.length;
+            return bgColor(fullLine + (trailingPad > 0 ? " ".repeat(trailingPad) : ""));
+          };
+          return [bgColor(topBorder), ...raw.map(wrapAndBg), bgColor(botBorder)];
+        },
+        handleInput: (data: string) => act(data),
+        invalidate: () => {},
+        dispose: () => cleanup(),
+      };
+      return component;
+    },
+    // A roomy overlay with visual margin so borders stand out from the terminal edge.
+    // Supports sidebar mode via opts.anchor="right-center".
+    {
+      overlay: true,
+      overlayOptions: {
+        width: opts.anchor === "right-center" ? "60%" : "94%",
+        maxHeight: "92%",
+        anchor: opts.anchor ?? "center",
+        margin: 1,
+      },
+    },
+  );
+}
