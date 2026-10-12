@@ -22,7 +22,12 @@ const ROOT = HERE; // pi-repo/
 const PI = path.join(ROOT, "pi");
 
 // Every extension dir that wants @earendil-works/* pointed at the local monorepo.
-const EXTENSIONS = ["pi-subagents", "pi-web-access"];
+const EXTENSIONS = [
+	"pi-subagents",
+	"pi-web-access",
+	"pi-mcp-adapter",
+	"pi-dynamic-workflows",
+];
 
 const PKG_LINKS = {
   "pi-agent-core": path.join(PI, "packages", "agent"),
