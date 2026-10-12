@@ -27,6 +27,7 @@ const EXTENSIONS = [
 	"pi-web-access",
 	"pi-mcp-adapter",
 	"pi-dynamic-workflows",
+	"pi-goal-x",
 ];
 
 const PKG_LINKS = {
